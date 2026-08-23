@@ -2120,6 +2120,21 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           broadcastToRoom(info.room, { type: "peer-mic", id: info.id, mic: info.mic });
           break;
         }
+        case "typing": {
+          if (!info.room) return;
+          // Purely relayed, no server-side state kept — the client is what
+          // decides when to (re)send true/false (see signalingClient.ts's
+          // setTyping); this only needs to forward it, and drops silently on
+          // excess like the other transient toggles above rather than
+          // surfacing an error for something this ephemeral.
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
+          broadcastToRoom(
+            info.room,
+            { type: "peer-typing", id: info.id, typing: Boolean(msg.typing) },
+            socket
+          );
+          break;
+        }
         case "chat": {
           if (!info.room) return;
           // Only rate-limited case besides "register"/"join" that gives the
