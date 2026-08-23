@@ -62,6 +62,8 @@ import {
   listBannedWords,
   setBannedWords,
   findBannedWord,
+  isAntiSpamEnabled,
+  setAntiSpamEnabled,
 } from "./moderationStore.js";
 import { MONGO_ENABLED, isMongoConnected } from "./mongo.js";
 import {
@@ -951,6 +953,13 @@ function disconnectClientsByIp(ip: string) {
 // immediately). Fire-and-forget on the ban itself since this runs on the hot
 // message-handling path.
 function recordRateLimitViolation(info: ClientInfo) {
+  // Admin-facing kill switch (GET/PUT /admin/antispam) — off entirely means
+  // not even counting, so re-enabling it later starts a fresh window instead
+  // of immediately banning someone for violations that piled up while it
+  // was off. Per-request limits from consumeRateLimit itself (the "hit
+  // rejected" case, not this violation-tracking layer) still apply either
+  // way — this only ever controls the auto-*ban*.
+  if (!isAntiSpamEnabled()) return;
   if (!recordViolation(info.ip, AUTO_BAN_VIOLATION_LIMIT, AUTO_BAN_VIOLATION_WINDOW_MS)) return;
   autoBansTotal.inc();
   void banIp(
@@ -1445,6 +1454,33 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     }
     const words = await setBannedWords(body.words as string[]);
     return { words };
+  });
+
+  // Kill switch for the auto-ban system (see recordRateLimitViolation) —
+  // lets an admin turn it off at runtime, no redeploy, e.g. if it's
+  // wrongly banning real users during an unrelated slowdown that makes
+  // their retries look like spam.
+  app.get(
+    "/admin/antispam",
+    { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      if (!requireAdmin(request)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+      return { enabled: isAntiSpamEnabled() };
+    }
+  );
+
+  app.put("/admin/antispam", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
+    if (!requireAdmin(request)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    if (typeof body.enabled !== "boolean") {
+      return reply.code(400).send({ error: "Campo 'enabled' inválido." });
+    }
+    const enabled = await setAntiSpamEnabled(body.enabled);
+    return { enabled };
   });
 
   app.get(

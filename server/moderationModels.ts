@@ -28,12 +28,19 @@ export const IpBanModel = model<IpBan>("IpBan", ipBanSchema, "ip_bans");
 interface ModerationConfigDoc {
   _id: string;
   bannedWords: string[];
+  // Master switch for the auto-ban system (see signaling.ts's
+  // recordRateLimitViolation) — an admin-facing kill switch for when it's
+  // doing more harm than good (e.g. banning real users during a slowdown
+  // that makes them look like they're spamming retries), without needing a
+  // redeploy to turn it back off.
+  antiSpamEnabled: boolean;
 }
 
 const moderationConfigSchema = new Schema<ModerationConfigDoc>(
   {
     _id: { type: String },
     bannedWords: { type: [String], default: [] },
+    antiSpamEnabled: { type: Boolean, default: true },
   },
   { versionKey: false }
 );

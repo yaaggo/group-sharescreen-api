@@ -37,6 +37,7 @@ try {
 interface ModerationDoc {
   bannedWords: string[];
   bans: IpBan[];
+  antiSpamEnabled: boolean;
 }
 
 // Both bans and banned words are read on every single WebSocket connection
@@ -45,6 +46,9 @@ interface ModerationDoc {
 let bansCache = new Map<string, IpBan>();
 let bannedWordsCache: string[] = [];
 let compiledWordFilter: RegExp | null = null;
+// See moderationModels.ts's ModerationConfigDoc.antiSpamEnabled — defaults
+// to on, same as the system always was before this switch existed.
+let antiSpamEnabledCache = true;
 
 function loadFromDisk(): ModerationDoc {
   try {
@@ -53,15 +57,20 @@ function loadFromDisk(): ModerationDoc {
     return {
       bannedWords: Array.isArray(parsed.bannedWords) ? parsed.bannedWords : [],
       bans: Array.isArray(parsed.bans) ? parsed.bans : [],
+      antiSpamEnabled: typeof parsed.antiSpamEnabled === "boolean" ? parsed.antiSpamEnabled : true,
     };
   } catch {
-    return { bannedWords: [], bans: [] };
+    return { bannedWords: [], bans: [], antiSpamEnabled: true };
   }
 }
 
 function saveToDisk() {
   try {
-    const doc: ModerationDoc = { bannedWords: bannedWordsCache, bans: [...bansCache.values()] };
+    const doc: ModerationDoc = {
+      bannedWords: bannedWordsCache,
+      bans: [...bansCache.values()],
+      antiSpamEnabled: antiSpamEnabledCache,
+    };
     fs.writeFileSync(DATA_FILE, JSON.stringify(doc));
   } catch {
     // Best-effort — moderation config still works in-memory for the life of
@@ -78,16 +87,16 @@ async function loadFromMongo(): Promise<ModerationDoc> {
     ModerationConfigModel.findById("config").lean(),
     IpBanModel.find().select("-_id").lean(),
   ]);
-  return { bannedWords: config?.bannedWords ?? [], bans: bans as IpBan[] };
+  return {
+    bannedWords: config?.bannedWords ?? [],
+    bans: bans as IpBan[],
+    antiSpamEnabled: config?.antiSpamEnabled ?? true,
+  };
 }
 
-async function saveBannedWordsToMongo(words: string[]) {
+async function saveModerationConfigToMongo(patch: Partial<Pick<ModerationDoc, "bannedWords" | "antiSpamEnabled">>) {
   await connectMongo();
-  await ModerationConfigModel.findByIdAndUpdate(
-    "config",
-    { bannedWords: words },
-    { upsert: true }
-  );
+  await ModerationConfigModel.findByIdAndUpdate("config", patch, { upsert: true });
 }
 
 async function saveBanToMongo(ban: IpBan) {
@@ -130,6 +139,7 @@ export async function initModerationStore(): Promise<void> {
   const doc = MONGO_ENABLED ? await loadFromMongo().catch(() => loadFromDisk()) : loadFromDisk();
   bansCache = new Map(doc.bans.map((b) => [b.ip, b]));
   bannedWordsCache = doc.bannedWords;
+  antiSpamEnabledCache = doc.antiSpamEnabled;
   compileWordFilter();
 }
 
@@ -190,9 +200,23 @@ export async function setBannedWords(words: string[]): Promise<string[]> {
   ].slice(0, MAX_BANNED_WORDS);
   bannedWordsCache = normalized;
   compileWordFilter();
-  if (MONGO_ENABLED) await saveBannedWordsToMongo(normalized);
+  if (MONGO_ENABLED) await saveModerationConfigToMongo({ bannedWords: normalized });
   else saveToDisk();
   return normalized;
+}
+
+// Sync, cache-only — see recordRateLimitViolation in signaling.ts, the one
+// hot-path caller. Defaults to on; only ever off when an admin has
+// explicitly flipped it via PUT /admin/antispam.
+export function isAntiSpamEnabled(): boolean {
+  return antiSpamEnabledCache;
+}
+
+export async function setAntiSpamEnabled(enabled: boolean): Promise<boolean> {
+  antiSpamEnabledCache = enabled;
+  if (MONGO_ENABLED) await saveModerationConfigToMongo({ antiSpamEnabled: enabled });
+  else saveToDisk();
+  return antiSpamEnabledCache;
 }
 
 // Returns the matched (folded) word for logging/feedback purposes, or null
