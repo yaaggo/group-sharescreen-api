@@ -15,6 +15,7 @@ export interface ConnectionLocation {
   lon: string;
 }
 
+
 // Returns null for an IP GeoIP can't place — a private/local address (dev,
 // or behind a proxy that isn't forwarding the real client IP), an
 // unroutable range, or just missing from the bundled offline database.
