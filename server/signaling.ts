@@ -56,6 +56,11 @@ import {
   type PartnerConfig,
 } from "./partnerStore.js";
 import {
+  loadPersistedSupporters,
+  savePersistedSupporters,
+  type Supporter,
+} from "./supporterStore.js";
+import {
   isIpBanned,
   isValidIp,
   listBans,
@@ -88,6 +93,8 @@ const PARTNER_TITLE_MAX_LEN = 80;
 const PARTNER_DESCRIPTION_MAX_LEN = 400;
 const PARTNER_BUTTON_LABEL_MAX_LEN = 40;
 const BAN_REASON_MAX_LEN = 200;
+const MAX_SUPPORTER_NAME_LEN = 80;
+const MAX_SUPPORTERS = 500;
 // How many rate-limit violations (across chat/join/register combined) the
 // same IP can rack up before it's treated as automated abuse rather than one
 // over-eager human and auto-banned the same way an admin doing it by hand
@@ -356,6 +363,19 @@ let currentAnnouncement: Announcement | null = null;
 // how one gets chosen for a given request/connection). Loaded from
 // partnerStore.js at startup, just like currentAnnouncement.
 let partnerConfig: PartnerConfig = { partners: [], emptyPercent: 0 };
+
+// Shown on hover over the "Apoiar projeto" button (see WatchRoom.tsx) — the
+// whole list, replaced wholesale on every admin edit, same "one flat list"
+// shape as bannedWords in moderationStore.ts. Loaded from supporterStore.js
+// at startup, just like currentAnnouncement/partnerConfig above. Kept
+// sorted by amount descending at rest, so every reader (the public GET, the
+// admin GET, every "supporters" broadcast) gets it pre-sorted for free —
+// see sortSupporters, the only place that ordering is ever decided.
+let currentSupporters: Supporter[] = [];
+
+function sortSupporters(supporters: Supporter[]): Supporter[] {
+  return [...supporters].sort((a, b) => b.amount - a.amount);
+}
 
 // Engagement counters per partner ad, keyed by id — mirrors
 // AnnouncementStatsEntry above (same dedupe-by-connection reasoning), but
@@ -1068,6 +1088,9 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     entry.sessionViews = persisted.sessionViews;
     entry.clicks = persisted.clicks;
   }
+  // Restores the configured supporters list the same way — see
+  // supporterStore.ts.
+  currentSupporters = sortSupporters(await loadPersistedSupporters());
 
   // Detects and reaps half-dead connections (network dropped without a clean
   // close, e.g. mobile network handoff, sleeping laptop, NAT/proxy silently
@@ -1309,6 +1332,58 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     await deletePersistedAnnouncement();
     broadcastToAll({ type: "announcement", announcement: null, live: true });
     return reply.code(204).send();
+  });
+
+  // Supporters list shown on hover over "Apoiar projeto" (see
+  // components/SupportersTooltip.tsx). Public and cheap — fetched once on
+  // page load, same budget as /partner. Live edits reach an already-open
+  // page via the "supporters" broadcast below instead, same as
+  // announcement/partner.
+  app.get("/supporters", { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } }, async () => {
+    return { supporters: currentSupporters };
+  });
+
+  app.get(
+    "/admin/supporters",
+    { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      if (!requireAdmin(request)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+      return { supporters: currentSupporters };
+    }
+  );
+
+  // Replaces the whole list at once — same shape as PUT /admin/banned-words,
+  // and for the same reason: simplest match for an admin textarea of one
+  // supporter per line, and avoids the list drifting out of sync with what
+  // the admin panel shows the way incremental add/remove endpoints could.
+  app.put("/admin/supporters", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
+    if (!requireAdmin(request)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    if (!Array.isArray(body.supporters)) {
+      return reply.code(400).send({ error: "Lista de apoiadores inválida." });
+    }
+    const parsed: Supporter[] = [];
+    for (const entry of body.supporters) {
+      if (!entry || typeof entry !== "object") {
+        return reply.code(400).send({ error: "Lista de apoiadores inválida." });
+      }
+      const rawEntry = entry as Record<string, unknown>;
+      const name =
+        typeof rawEntry.name === "string" ? rawEntry.name.trim().slice(0, MAX_SUPPORTER_NAME_LEN) : "";
+      const amount = Number(rawEntry.amount);
+      if (!name || !Number.isFinite(amount) || amount < 0) {
+        return reply.code(400).send({ error: "Cada apoiador precisa de nome e valor válidos." });
+      }
+      parsed.push({ name, amount });
+    }
+    currentSupporters = sortSupporters(parsed.slice(0, MAX_SUPPORTERS));
+    await savePersistedSupporters(currentSupporters);
+    broadcastToAll({ type: "supporters", supporters: currentSupporters });
+    return { supporters: currentSupporters };
   });
 
   // Sidebar partner-ad slot (see components/PartnerCard.tsx). Public and
