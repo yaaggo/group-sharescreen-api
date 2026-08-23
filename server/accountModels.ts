@@ -5,6 +5,11 @@ export interface AccountDoc {
   username: string;
   displayName: string;
   flags: string[];
+  // Cosmetic score shown in the room header (see WatchRoom's top bar). No
+  // in-app way to earn it yet — only ever changed by hand directly in the
+  // database, which is also why it lives at the top level (not under
+  // `account`) alongside the other fields a plain admin edit might touch.
+  points: number;
   // Sensitive/internal — excluded from queries by default (see `select:
   // false` below), same intent as the whole-list `select("-_id")` pattern
   // in moderationStore.ts: never accidentally leak this into an API
@@ -57,6 +62,7 @@ const accountSchema = new Schema<AccountDoc>(
     username: { type: String, required: true, unique: true },
     displayName: { type: String, required: true },
     flags: { type: [String], default: [] },
+    points: { type: Number, default: 0 },
     account: {
       type: new Schema(
         {

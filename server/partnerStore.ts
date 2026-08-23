@@ -25,6 +25,14 @@ export interface Partner {
   // remove it after the fact instead of it just silently vanishing.
   expiresAt: number | null;
   createdAt: number;
+  // Optional watch-to-earn reward (see PartnerRewardModal.tsx) — an mp4
+  // whoever's watching can play through in full to unlock `rewardPoints` on
+  // their account, once ever (see claimPersistedPartnerReward below). null
+  // means this ad has no reward video at all; rewardPoints is only ever
+  // non-null when rewardVideoUrl also is (see signaling.ts's
+  // parsePartnerBody, which enforces that pairing on every write).
+  rewardVideoUrl: string | null;
+  rewardPoints: number | null;
 }
 
 export interface PartnerConfig {
@@ -148,6 +156,14 @@ export interface PartnerStats {
   views: number;
   sessionViews: number;
   clicks: number;
+  // Watch-to-earn funnel (see PartnerRewardModal.tsx) — how many times the
+  // "Ganhar X Pontos" button opened the video, and how many of those plays
+  // reached the end for real (see signaling.ts's REQUIRED_WATCH_FRACTION
+  // check before "partner-reward-video-completed" is even sent). Raw counts,
+  // same as views/clicks — a person who reopens the popup or rewatches after
+  // already claiming counts again, same as a repeat impression does.
+  rewardVideoOpens: number;
+  rewardVideoCompletions: number;
 }
 
 const PARTNER_STATS_FILE_PATH = path.join(PARTNER_DATA_DIR, "partner-stats.json");
@@ -171,6 +187,11 @@ function normalizeStats(parsed: unknown): Record<string, PartnerStats> {
       // that never rotated.
       sessionViews: typeof entry.sessionViews === "number" ? entry.sessionViews : 0,
       clicks: typeof entry.clicks === "number" ? entry.clicks : 0,
+      // Absent in anything written before the reward feature existed —
+      // same "old data reads as zero" reasoning as sessionViews above.
+      rewardVideoOpens: typeof entry.rewardVideoOpens === "number" ? entry.rewardVideoOpens : 0,
+      rewardVideoCompletions:
+        typeof entry.rewardVideoCompletions === "number" ? entry.rewardVideoCompletions : 0,
     };
   }
   return out;
@@ -219,8 +240,18 @@ export async function loadPersistedPartnerStats(): Promise<Record<string, Partne
       if (sep < 0) continue;
       const id = field.slice(0, sep);
       const metric = field.slice(sep + 1);
-      if (metric !== "views" && metric !== "sessionViews" && metric !== "clicks") continue;
-      const entry = out[id] ?? (out[id] = { views: 0, sessionViews: 0, clicks: 0 });
+      if (
+        metric !== "views" &&
+        metric !== "sessionViews" &&
+        metric !== "clicks" &&
+        metric !== "rewardVideoOpens" &&
+        metric !== "rewardVideoCompletions"
+      ) {
+        continue;
+      }
+      const entry =
+        out[id] ??
+        (out[id] = { views: 0, sessionViews: 0, clicks: 0, rewardVideoOpens: 0, rewardVideoCompletions: 0 });
       entry[metric] = Number(value) || 0;
     }
     return out;
@@ -241,13 +272,27 @@ export async function incrementPersistedPartnerStats(
   const views = delta.views ?? 0;
   const sessionViews = delta.sessionViews ?? 0;
   const clicks = delta.clicks ?? 0;
-  if (views === 0 && sessionViews === 0 && clicks === 0) return;
+  const rewardVideoOpens = delta.rewardVideoOpens ?? 0;
+  const rewardVideoCompletions = delta.rewardVideoCompletions ?? 0;
+  if (
+    views === 0 &&
+    sessionViews === 0 &&
+    clicks === 0 &&
+    rewardVideoOpens === 0 &&
+    rewardVideoCompletions === 0
+  ) {
+    return;
+  }
   if (!REDIS_URL) {
     const stats = loadStatsFromDisk();
-    const entry = stats[id] ?? (stats[id] = { views: 0, sessionViews: 0, clicks: 0 });
+    const entry =
+      stats[id] ??
+      (stats[id] = { views: 0, sessionViews: 0, clicks: 0, rewardVideoOpens: 0, rewardVideoCompletions: 0 });
     entry.views += views;
     entry.sessionViews += sessionViews;
     entry.clicks += clicks;
+    entry.rewardVideoOpens += rewardVideoOpens;
+    entry.rewardVideoCompletions += rewardVideoCompletions;
     saveStatsToDisk();
     return;
   }
@@ -259,6 +304,12 @@ export async function incrementPersistedPartnerStats(
       multi.hIncrBy(REDIS_STATS_KEY, statsField(id, "sessionViews"), sessionViews);
     }
     if (clicks !== 0) multi.hIncrBy(REDIS_STATS_KEY, statsField(id, "clicks"), clicks);
+    if (rewardVideoOpens !== 0) {
+      multi.hIncrBy(REDIS_STATS_KEY, statsField(id, "rewardVideoOpens"), rewardVideoOpens);
+    }
+    if (rewardVideoCompletions !== 0) {
+      multi.hIncrBy(REDIS_STATS_KEY, statsField(id, "rewardVideoCompletions"), rewardVideoCompletions);
+    }
     await multi.exec();
   } catch (err) {
     console.error("[partnerStore] Erro ao salvar estatísticas no Redis:", (err as Error).message);
@@ -413,5 +464,141 @@ export async function deletePersistedPartnerStats(id: string): Promise<void> {
     await client.del(uniquesKey(id));
   } catch (err) {
     console.error("[partnerStore] Erro ao apagar estatísticas do Redis:", (err as Error).message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reward-video claims
+// ---------------------------------------------------------------------------
+
+// Who has already collected a given ad's watch-to-earn reward — same
+// dedupe-by-set reasoning as the unique-viewers section above (an award
+// cannot be "un-double-counted" after the fact, so what has to be remembered
+// is who already got it), except keyed by account id rather than the looser
+// IP/account viewer key: this gate has real value attached, so it must
+// survive a claim attempt from a different browser/device on the *same*
+// account, not just repeat visits from the same one.
+const REDIS_REWARD_CLAIMS_KEY_PREFIX = "sharescreen:partner-reward-claims:";
+
+function rewardClaimsKey(id: string): string {
+  return REDIS_REWARD_CLAIMS_KEY_PREFIX + id;
+}
+
+const PARTNER_REWARD_CLAIMS_FILE_PATH = path.join(PARTNER_DATA_DIR, "partner-reward-claims.json");
+
+// Mirror of the claims file for the no-Redis fallback, same shape and same
+// reasoning as diskUniques above. Null until the first load.
+let diskRewardClaims: Record<string, Set<string>> | null = null;
+
+function loadRewardClaimsFromDisk(): Record<string, Set<string>> {
+  if (diskRewardClaims) return diskRewardClaims;
+  const out: Record<string, Set<string>> = {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(PARTNER_REWARD_CLAIMS_FILE_PATH, "utf8")) as unknown;
+    if (parsed && typeof parsed === "object") {
+      for (const [id, value] of Object.entries(parsed as Record<string, unknown>)) {
+        if (Array.isArray(value)) out[id] = new Set(value.filter((v) => typeof v === "string"));
+      }
+    }
+  } catch {
+    // No file yet, or unreadable — start empty, same as the other fallbacks.
+  }
+  diskRewardClaims = out;
+  return diskRewardClaims;
+}
+
+function saveRewardClaimsToDisk() {
+  try {
+    const plain: Record<string, string[]> = {};
+    for (const [id, set] of Object.entries(diskRewardClaims ?? {})) plain[id] = [...set];
+    fs.writeFileSync(PARTNER_REWARD_CLAIMS_FILE_PATH, JSON.stringify(plain));
+  } catch {
+    // Best-effort, same as the other writers here.
+  }
+}
+
+/**
+ * Records that `accountId` collected this ad's reward, and reports whether
+ * that's news — the caller (signaling.ts's POST /partner/:id/claim-reward)
+ * only awards points when this returns `true`, which is what makes a retried
+ * or replayed claim request a no-op instead of a second payout. Redis's SADD
+ * already returns "was this new" as a single atomic operation, so the Redis
+ * path needs no separate read-then-write; the disk path is safe to do the
+ * same check-then-set non-atomically since it only ever runs in this one
+ * process.
+ */
+export async function claimPersistedPartnerReward(id: string, accountId: string): Promise<boolean> {
+  if (!id || !accountId) return false;
+  if (!REDIS_URL) {
+    const claims = loadRewardClaimsFromDisk();
+    const set = claims[id] ?? (claims[id] = new Set());
+    if (set.has(accountId)) return false;
+    set.add(accountId);
+    saveRewardClaimsToDisk();
+    return true;
+  }
+  try {
+    const client = await getRedis();
+    const added: number = await client.sAdd(rewardClaimsKey(id), accountId);
+    return added > 0;
+  } catch (err) {
+    console.error("[partnerStore] Erro ao registrar resgate de recompensa no Redis:", (err as Error).message);
+    // Fails closed: a Redis hiccup must not look like "never claimed" and
+    // hand out a second reward for the same account.
+    return false;
+  }
+}
+
+/**
+ * How many distinct accounts have collected each ad's reward — the admin
+ * panel's "quantas pessoas resgataram os pontos" number. Unlike
+ * rewardVideoOpens/rewardVideoCompletions (running counts that can double-
+ * count a repeat visit), this is a set's cardinality: it cannot be inflated
+ * by the same account claiming twice, because claimPersistedPartnerReward
+ * above never lets a second claim through in the first place. Unknown ids
+ * read 0.
+ */
+export async function loadPersistedPartnerRewardClaimCounts(
+  ids: string[]
+): Promise<Record<string, number>> {
+  const out: Record<string, number> = {};
+  for (const id of ids) out[id] = 0;
+  if (ids.length === 0) return out;
+  if (!REDIS_URL) {
+    const claims = loadRewardClaimsFromDisk();
+    for (const id of ids) out[id] = claims[id]?.size ?? 0;
+    return out;
+  }
+  try {
+    const client = await getRedis();
+    const multi = client.multi();
+    for (const id of ids) multi.sCard(rewardClaimsKey(id));
+    const results: unknown[] = (await multi.exec()) ?? [];
+    ids.forEach((id, i) => {
+      out[id] = Number(results[i]) || 0;
+    });
+    return out;
+  } catch (err) {
+    console.error("[partnerStore] Erro ao contar resgates de recompensa no Redis:", (err as Error).message);
+    return out;
+  }
+}
+
+// Only called when the ad itself is deleted — same reasoning as
+// deletePersistedPartnerStats's uniques cleanup above.
+export async function deletePersistedPartnerRewardClaims(id: string): Promise<void> {
+  if (!REDIS_URL) {
+    const claims = loadRewardClaimsFromDisk();
+    if (claims[id]) {
+      delete claims[id];
+      saveRewardClaimsToDisk();
+    }
+    return;
+  }
+  try {
+    const client = await getRedis();
+    await client.del(rewardClaimsKey(id));
+  } catch (err) {
+    console.error("[partnerStore] Erro ao apagar resgates de recompensa no Redis:", (err as Error).message);
   }
 }

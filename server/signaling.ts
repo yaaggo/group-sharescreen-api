@@ -18,13 +18,14 @@ import {
 import { recordViolation } from "./rateLimiter.js";
 import { verifyTurnstileToken, TURNSTILE_ENABLED } from "./turnstile.js";
 import { lookupConnectionLocation, type ConnectionLocation } from "./geoip.js";
-import { signToken, verifyToken, requireAdmin } from "./auth.js";
+import { signToken, verifyToken, requireAdmin, getBearerToken } from "./auth.js";
 import {
   createAccount,
   verifyAccountLogin,
   refreshAccountFromMongo,
   getAccountConnections,
   isNameReserved,
+  addAccountPoints,
   USERNAME_RE,
 } from "./accountStore.js";
 import {
@@ -52,6 +53,9 @@ import {
   deletePersistedPartnerStats,
   recordPersistedPartnerViewer,
   loadPersistedPartnerUniqueCounts,
+  claimPersistedPartnerReward,
+  deletePersistedPartnerRewardClaims,
+  loadPersistedPartnerRewardClaimCounts,
   type Partner,
   type PartnerConfig,
 } from "./partnerStore.js";
@@ -92,6 +96,8 @@ const ANNOUNCEMENT_BUTTON_LABEL_MAX_LEN = 40;
 const PARTNER_TITLE_MAX_LEN = 80;
 const PARTNER_DESCRIPTION_MAX_LEN = 400;
 const PARTNER_BUTTON_LABEL_MAX_LEN = 40;
+const PARTNER_REWARD_POINTS_MIN = 1;
+const PARTNER_REWARD_POINTS_MAX = 100_000;
 const BAN_REASON_MAX_LEN = 200;
 const MAX_SUPPORTER_NAME_LEN = 80;
 const MAX_SUPPORTERS = 500;
@@ -399,13 +405,24 @@ interface PartnerStatsEntry {
   // One per connection — see the "partner-session-view" case.
   sessionViews: number;
   clicks: number;
+  // Watch-to-earn funnel (see PartnerRewardModal.tsx) — see PartnerStats in
+  // partnerStore.ts for what these do and don't dedupe.
+  rewardVideoOpens: number;
+  rewardVideoCompletions: number;
 }
 const partnerStats = new Map<string, PartnerStatsEntry>();
 
 function getPartnerStats(id: string): PartnerStatsEntry {
   let entry = partnerStats.get(id);
   if (!entry) {
-    entry = { viewerIds: new Set(), views: 0, sessionViews: 0, clicks: 0 };
+    entry = {
+      viewerIds: new Set(),
+      views: 0,
+      sessionViews: 0,
+      clicks: 0,
+      rewardVideoOpens: 0,
+      rewardVideoCompletions: 0,
+    };
     partnerStats.set(id, entry);
   }
   return entry;
@@ -417,6 +434,8 @@ function partnerStatsSummary(id: string) {
     views: entry?.views ?? 0,
     sessionViews: entry?.sessionViews ?? 0,
     clicks: entry?.clicks ?? 0,
+    rewardVideoOpens: entry?.rewardVideoOpens ?? 0,
+    rewardVideoCompletions: entry?.rewardVideoCompletions ?? 0,
   };
 }
 
@@ -435,13 +454,22 @@ function partnerViewerKey(info: ClientInfo): string {
   return info.accountId ? `acct:${info.accountId}` : `ip:${info.ip}`;
 }
 
-// The same summary plus the unique-viewer counts, which live in the store
-// rather than in this process (a set that restarted empty would recount every
-// returning visitor on each deploy — see partnerStore's recordPersistedPartnerViewer).
+// The same summary plus the unique-viewer and reward-claim counts, both of
+// which live in the store rather than in this process — a set that restarted
+// empty would recount every returning visitor on each deploy (see
+// partnerStore's recordPersistedPartnerViewer) or, worse, let an account
+// collect a reward a second time after a restart (see
+// claimPersistedPartnerReward).
 async function partnerStatsSummaries(ids: string[]) {
-  const uniques = await loadPersistedPartnerUniqueCounts(ids);
+  const [uniques, rewardClaims] = await Promise.all([
+    loadPersistedPartnerUniqueCounts(ids),
+    loadPersistedPartnerRewardClaimCounts(ids),
+  ]);
   return Object.fromEntries(
-    ids.map((id) => [id, { ...partnerStatsSummary(id), uniqueViews: uniques[id] ?? 0 }])
+    ids.map((id) => [
+      id,
+      { ...partnerStatsSummary(id), uniqueViews: uniques[id] ?? 0, rewardClaims: rewardClaims[id] ?? 0 },
+    ])
   );
 }
 
@@ -487,6 +515,8 @@ function publicPartner(p: Partner) {
     buttonBackgroundColor: p.buttonBackgroundColor,
     buttonTextColor: p.buttonTextColor,
     expiresAt: p.expiresAt,
+    rewardVideoUrl: p.rewardVideoUrl,
+    rewardPoints: p.rewardPoints,
   };
 }
 
@@ -802,6 +832,31 @@ function parsePartnerBody(body: Record<string, unknown>): ParsedPartnerFields | 
   const expiresAt =
     typeof body.expiresAt === "number" && Number.isFinite(body.expiresAt) ? body.expiresAt : null;
 
+  // Watch-to-earn reward — both optional, but only ever a pair: a reward
+  // amount with no video to earn it from (or vice versa) would just be a
+  // dangling config the admin form can't even produce, so this is enforced
+  // here rather than trusted from the request.
+  const rawRewardVideoUrl = typeof body.rewardVideoUrl === "string" ? body.rewardVideoUrl.trim() : "";
+  if (rawRewardVideoUrl && !isValidHttpUrl(rawRewardVideoUrl)) {
+    return { error: "Link do vídeo de recompensa inválido — use uma URL http(s) completa." };
+  }
+  const rewardVideoUrl = rawRewardVideoUrl || null;
+  let rewardPoints: number | null = null;
+  if (rewardVideoUrl) {
+    const rawRewardPoints =
+      typeof body.rewardPoints === "number" && Number.isFinite(body.rewardPoints)
+        ? Math.round(body.rewardPoints)
+        : NaN;
+    if (
+      !Number.isFinite(rawRewardPoints) ||
+      rawRewardPoints < PARTNER_REWARD_POINTS_MIN ||
+      rawRewardPoints > PARTNER_REWARD_POINTS_MAX
+    ) {
+      return { error: `Pontos da recompensa devem ser entre ${PARTNER_REWARD_POINTS_MIN} e ${PARTNER_REWARD_POINTS_MAX}.` };
+    }
+    rewardPoints = rawRewardPoints;
+  }
+
   return {
     title,
     description,
@@ -811,6 +866,8 @@ function parsePartnerBody(body: Record<string, unknown>): ParsedPartnerFields | 
     ...colors,
     weight,
     expiresAt,
+    rewardVideoUrl,
+    rewardPoints,
   };
 }
 
@@ -1087,6 +1144,8 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     entry.views = persisted.views;
     entry.sessionViews = persisted.sessionViews;
     entry.clicks = persisted.clicks;
+    entry.rewardVideoOpens = persisted.rewardVideoOpens;
+    entry.rewardVideoCompletions = persisted.rewardVideoCompletions;
   }
   // Restores the configured supporters list the same way — see
   // supporterStore.ts.
@@ -1418,6 +1477,36 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     return { partner: picked ? publicPartner(picked) : null };
   });
 
+  // Pays out a partner ad's watch-to-earn reward (see PartnerRewardModal.tsx
+  // — it only calls this once the video's `ended` event fires, having blocked
+  // skipping ahead of it) — requires a real account (guests have nowhere to
+  // hold points, see accountModels.ts), and pays out at most once per
+  // account per ad, enforced server-side (claimPersistedPartnerReward) rather
+  // than trusted from local storage, which is only ever a UI convenience.
+  app.post(
+    "/partner/:id/claim-reward",
+    { config: { rateLimit: { max: 20, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      const payload = verifyToken(getBearerToken(request.headers.authorization));
+      if (!payload || payload.guest) {
+        return reply
+          .code(401)
+          .send({ error: "Crie uma conta ou entre em uma para receber pontos assistindo." });
+      }
+      const { id } = request.params as { id: string };
+      const partner = partnerConfig.partners.find((p) => p.id === id);
+      if (!partner || !partner.rewardVideoUrl || !partner.rewardPoints) {
+        return reply.code(404).send({ error: "Esse anúncio não tem recompensa em vídeo." });
+      }
+      const claimed = await claimPersistedPartnerReward(id, payload.sub);
+      if (!claimed) {
+        return reply.code(409).send({ error: "Você já resgatou essa recompensa." });
+      }
+      const points = await addAccountPoints(payload.sub, partner.rewardPoints);
+      return { points };
+    }
+  );
+
   // Full partner list + live stats for the admin panel — unlike GET
   // /partner, includes every partner (even expired/inactive ones — see
   // Partner.expiresAt's doc comment) and the admin-only weight/createdAt
@@ -1481,6 +1570,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     partnerConfig = { ...partnerConfig, partners: partnerConfig.partners.filter((p) => p.id !== id) };
     partnerStats.delete(id);
     await deletePersistedPartnerStats(id);
+    await deletePersistedPartnerRewardClaims(id);
     await savePersistedPartnerConfig(partnerConfig);
     broadcastPartnerUpdate();
     return reply.code(204).send();
@@ -2294,6 +2384,43 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "partner-click"))) return;
           getPartnerStats(id).clicks += 1;
           void incrementPersistedPartnerStats(id, { clicks: 1 });
+          break;
+        }
+        // Watch-to-earn funnel (see PartnerRewardModal.tsx) — sent when the
+        // "Ganhar X Pontos" popup opens. Gated on the ad actually having a
+        // reward configured (not just existing), same reasoning as the
+        // "-completed" case below: only real reward ads should ever move
+        // these counters, so an id for an ad with no video can't inflate a
+        // number the admin panel can't otherwise explain.
+        case "partner-reward-video-open": {
+          const id = typeof msg.id === "string" ? msg.id : "";
+          const partner = partnerConfig.partners.find((p) => p.id === id);
+          if (!partner || !partner.rewardVideoUrl || !partner.rewardPoints) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "partner-reward-video-open"))) {
+            return;
+          }
+          getPartnerStats(id).rewardVideoOpens += 1;
+          void incrementPersistedPartnerStats(id, { rewardVideoOpens: 1 });
+          break;
+        }
+        // Sent when the video reaches `ended` with enough of it genuinely
+        // watched to unlock "Receber Recompensa" (see the modal's own
+        // REQUIRED_WATCH_FRACTION check) — *not* the same event as actually
+        // claiming the reward. Someone can watch the whole thing and still
+        // never click claim (or not have an account to claim with at all),
+        // which is exactly the gap this number and rewardClaims together are
+        // meant to show the admin panel.
+        case "partner-reward-video-completed": {
+          const id = typeof msg.id === "string" ? msg.id : "";
+          const partner = partnerConfig.partners.find((p) => p.id === id);
+          if (!partner || !partner.rewardVideoUrl || !partner.rewardPoints) return;
+          if (
+            !(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "partner-reward-video-completed"))
+          ) {
+            return;
+          }
+          getPartnerStats(id).rewardVideoCompletions += 1;
+          void incrementPersistedPartnerStats(id, { rewardVideoCompletions: 1 });
           break;
         }
         default:

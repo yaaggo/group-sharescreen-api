@@ -11,6 +11,8 @@ export interface PublicAccount {
   username: string;
   displayName: string;
   flags: string[];
+  // See accountModels.ts's AccountDoc.points — DB-edited only, for now.
+  points: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -115,6 +117,9 @@ function docToFullAccount(doc: AccountDoc): FullAccount {
     username: doc.username,
     displayName: doc.displayName,
     flags: doc.flags,
+    // Absent on accounts written before this field existed — same
+    // "old data reads as the safe default" reasoning as `oauth` below.
+    points: doc.points ?? 0,
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
     passwordHash: doc.account.passwordHash ?? null,
@@ -145,6 +150,7 @@ async function persistNewAccount(account: FullAccount): Promise<void> {
       username: account.username,
       displayName: account.displayName,
       flags: account.flags,
+      points: account.points,
       account: {
         passwordHash: account.passwordHash,
         ips: account.ips,
@@ -201,6 +207,33 @@ async function persistAccountIdentity(account: FullAccount): Promise<void> {
   void invalidateCachedAccount(account.id);
 }
 
+// $inc rather than a read-modify-write of the field this process already has
+// cached — several claims (different ads, or the same one from two tabs
+// racing) landing in the same instant must all add up, not clobber each
+// other down to whichever write happened to land last.
+async function persistAccountPointsIncrement(id: string, amount: number): Promise<void> {
+  if (MONGO_ENABLED) {
+    await connectMongo();
+    await AccountModel.findOneAndUpdate({ id }, { $inc: { points: amount }, updatedAt: Date.now() });
+  } else {
+    saveToDisk();
+  }
+  void invalidateCachedAccount(id);
+}
+
+// Awards `amount` points to an account — currently the only in-app way to
+// earn any (see server/signaling.ts's POST /partner/:id/claim-reward); every
+// other change to this field is still a direct database edit. Returns the
+// new total, or null if the account no longer exists.
+export async function addAccountPoints(accountId: string, amount: number): Promise<number | null> {
+  const account = accountsById.get(accountId);
+  if (!account) return null;
+  account.points = (account.points ?? 0) + amount;
+  account.updatedAt = Date.now();
+  await persistAccountPointsIncrement(accountId, amount);
+  return account.points;
+}
+
 function indexAccount(account: FullAccount) {
   accountsById.set(account.id, account);
   accountsByUsername.set(fold(account.username), account.id);
@@ -220,6 +253,7 @@ export function toPublicAccount(account: FullAccount): PublicAccount {
     username: account.username,
     displayName: account.displayName,
     flags: account.flags,
+    points: account.points ?? 0,
     createdAt: account.createdAt,
     updatedAt: account.updatedAt,
   };
@@ -421,6 +455,7 @@ export async function createAccount(
     username,
     displayName,
     flags,
+    points: 0,
     createdAt: now,
     updatedAt: now,
     passwordHash,
@@ -463,6 +498,7 @@ export async function createOAuthAccount(options: {
     username,
     displayName,
     flags: [],
+    points: 0,
     createdAt: now,
     updatedAt: now,
     passwordHash: null,
