@@ -26,6 +26,7 @@ import {
   getAccountConnections,
   isNameReserved,
   addAccountPoints,
+  addAccountCallStats,
   USERNAME_RE,
 } from "./accountStore.js";
 import {
@@ -252,6 +253,16 @@ interface ClientInfo {
   // otherwise reclaiming an id would also silently inherit (or hand off)
   // whatever budget that id's bucket happened to have left.
   rateLimitKey: string;
+  // Wall-clock start of the currently-open segment of each, in ms since
+  // epoch — undefined whenever that segment isn't open (out of a room / mic
+  // off / not sharing). See flushClientStats, which turns these into deltas
+  // added to the account's cumulative stats (accountStore.ts's
+  // addAccountCallStats) the moment each segment closes. Never set at all
+  // for a moderator's admin-join ghost connection — surveilling a room isn't
+  // "being in a call."
+  joinedAt?: number;
+  micOnAt?: number;
+  sharingOnAt?: number;
 }
 
 // Extends RoomRecord (ownerId/private/flags/code — see roomStore.ts) with
@@ -941,6 +952,11 @@ function peerSummary(info: ClientInfo) {
     // info.flags is only ever set alongside accountId (see the "register"
     // handler). The client shows a badge when this includes "VERIFIED".
     flags: info.flags ?? [],
+    // Stable per-account/per-guest id — see stableUserId. The client only
+    // ever treats this as a real, viewable profile when `isGuest` is false;
+    // for a guest it's a guest id, not an account, and GET /users/:id below
+    // would just 404 on it.
+    userId: stableUserId(info),
     ...(info.isModerator ? { role: "moderator" as const } : {}),
   };
 }
@@ -966,6 +982,24 @@ function realSharingCount(roomInfo: RoomInfo): number {
     if (client && !client.isModerator && client.sharing) count += 1;
   }
   return count;
+}
+
+// Whether `accountId` currently has a live connection in a *public* room —
+// used by GET /users/:id below to show "está numa sala pública agora"
+// (see the user profile page). Deliberately never reports a private room:
+// unlike a public one, being in a private room isn't something a stranger
+// looking someone up should be able to discover. A moderator's admin-join
+// ghost connection is skipped too — surveilling a room isn't "being" in it.
+function findLivePublicRoomForAccount(
+  accountId: string
+): { room: string; peopleCount: number } | null {
+  for (const info of clientsById.values()) {
+    if (info.accountId !== accountId || !info.room || info.isModerator) continue;
+    if (isPrivateRoom(info.room)) continue;
+    const roomInfo = rooms.get(info.room);
+    return { room: info.room, peopleCount: roomInfo ? realPeopleCount(roomInfo) : 1 };
+  }
+  return null;
 }
 
 // Cancels a pending scheduleRoomDeletion for `room`, if any — called
@@ -996,7 +1030,42 @@ function scheduleRoomDeletion(room: string) {
   roomDeletionTimers.set(room, timer);
 }
 
+// Whole seconds elapsed since `start` (ms since epoch) — never negative,
+// since a clock oddity or a start stamped this same instant shouldn't ever
+// credit (or debit) an account for negative time.
+function secondsSince(start: number, now: number): number {
+  return Math.max(0, Math.round((now - start) / 1000));
+}
+
+// Closes out whatever segments are currently open on `info` (call time, and
+// mic/share time if either was left on) and credits the account for them —
+// called from every place a connection actually stops being "in a room":
+// leaveRoom and detachSession below. Also the only place these three
+// timestamps ever get cleared, so it's safe to call unconditionally even
+// when nothing is actually open (a plain no-op delta is dropped rather than
+// sent as a zero-valued update).
+//
+// Deliberately keyed off the timestamps alone, not info.mic/info.sharing —
+// those may or may not have been reset to false by the caller already
+// (leaveRoom resets them right after this runs), and a timestamp is only
+// ever set while the thing it tracks is genuinely on, so checking for its
+// presence is equivalent and doesn't depend on call order.
+function flushClientStats(info: ClientInfo) {
+  const now = Date.now();
+  const delta: { callSeconds?: number; micSeconds?: number; shareSeconds?: number } = {};
+  if (info.joinedAt !== undefined) delta.callSeconds = secondsSince(info.joinedAt, now);
+  if (info.micOnAt !== undefined) delta.micSeconds = secondsSince(info.micOnAt, now);
+  if (info.sharingOnAt !== undefined) delta.shareSeconds = secondsSince(info.sharingOnAt, now);
+  info.joinedAt = undefined;
+  info.micOnAt = undefined;
+  info.sharingOnAt = undefined;
+  if (info.accountId && (delta.callSeconds || delta.micSeconds || delta.shareSeconds)) {
+    void addAccountCallStats(info.accountId, delta);
+  }
+}
+
 function leaveRoom(info: ClientInfo) {
+  flushClientStats(info);
   if (!info.room) return;
   const room = info.room;
   const roomInfo = rooms.get(room);
@@ -1057,6 +1126,11 @@ const SUPERSEDED_CLOSE_CODE = 4000;
 // *without* broadcasting peer-left, since this identity is carried over
 // seamlessly to the new socket rather than actually leaving the room.
 function detachSession(info: ClientInfo) {
+  // A reconnect still ends this connection's open call/mic/share segments —
+  // the new socket that reclaims this identity starts fresh ones of its own
+  // in "join" below, rather than this old ClientInfo (about to be discarded)
+  // silently losing whatever it had accumulated.
+  flushClientStats(info);
   if (info.room) {
     const roomInfo = rooms.get(info.room);
     if (roomInfo) {
@@ -1281,6 +1355,18 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     // doesn't (see accountStore.ts), and the client needs to know that to
     // show the right options instead of an empty password form.
     return { account, connections: getAccountConnections(account.id) };
+  });
+
+  // Public profile page (see app/user/[id]/page.tsx) — reachable by clicking
+  // a name in the room header or the participant list, both of which now
+  // send the account id as PeerInfo.userId (see peerSummary). Unauthenticated
+  // on purpose, same as /partner and /rooms: nothing here is more sensitive
+  // than what a room's own peer list already shows to everyone in it.
+  app.get("/users/:id", { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } }, async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const account = await refreshAccountFromMongo(id);
+    if (!account) return reply.code(404).send({ error: "Usuário não encontrado." });
+    return { account, live: findLivePublicRoomForAccount(id) };
   });
 
   // Full room directory for moderators — unlike /rooms, this includes
@@ -2066,6 +2152,10 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           info.room = room;
           info.sharing = false;
           info.mic = false;
+          // Starts this connection's call-time segment (see
+          // flushClientStats) — never for a moderator's admin-join ghost
+          // connection, which never reaches this branch anyway.
+          info.joinedAt = Date.now();
           let roomInfo = rooms.get(room);
           if (!roomInfo) {
             // Reloads any chat history and RoomRecord still persisted
@@ -2118,7 +2208,14 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           flushPendingSignals(info);
           broadcastToRoom(
             room,
-            { type: "peer-joined", id: info.id, name: info.name, isGuest: !info.accountId, flags: info.flags ?? [] },
+            {
+              type: "peer-joined",
+              id: info.id,
+              name: info.name,
+              isGuest: !info.accountId,
+              flags: info.flags ?? [],
+              userId: stableUserId(info),
+            },
             socket
           );
           break;
@@ -2199,14 +2296,41 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           // transient toggle state, not a one-shot user action — the next
           // real toggle just propagates normally once the window resets.
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
-          info.sharing = Boolean(msg.sharing);
+          const nextSharing = Boolean(msg.sharing);
+          // Opens/closes this connection's share-time segment (see
+          // flushClientStats) — turning on starts the timer (only if it
+          // wasn't already running, so a duplicate "sharing:true" is a
+          // no-op); turning off closes it out and credits the account right
+          // here, rather than waiting for the segment to close some other
+          // way later.
+          if (nextSharing) {
+            if (info.sharingOnAt === undefined) info.sharingOnAt = Date.now();
+          } else if (info.sharingOnAt !== undefined) {
+            const shareSeconds = secondsSince(info.sharingOnAt, Date.now());
+            info.sharingOnAt = undefined;
+            if (info.accountId && shareSeconds > 0) {
+              void addAccountCallStats(info.accountId, { shareSeconds });
+            }
+          }
+          info.sharing = nextSharing;
           broadcastToRoom(info.room, { type: "peer-sharing", id: info.id, sharing: info.sharing });
           break;
         }
         case "mic": {
           if (!info.room) return;
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
-          info.mic = Boolean(msg.mic);
+          const nextMic = Boolean(msg.mic);
+          // Same open/close-a-segment reasoning as "sharing" above.
+          if (nextMic) {
+            if (info.micOnAt === undefined) info.micOnAt = Date.now();
+          } else if (info.micOnAt !== undefined) {
+            const micSeconds = secondsSince(info.micOnAt, Date.now());
+            info.micOnAt = undefined;
+            if (info.accountId && micSeconds > 0) {
+              void addAccountCallStats(info.accountId, { micSeconds });
+            }
+          }
+          info.mic = nextMic;
           broadcastToRoom(info.room, { type: "peer-mic", id: info.id, mic: info.mic });
           break;
         }

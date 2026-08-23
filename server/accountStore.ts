@@ -13,6 +13,15 @@ export interface PublicAccount {
   flags: string[];
   // See accountModels.ts's AccountDoc.points — DB-edited only, for now.
   points: number;
+  // See accountModels.ts's AccountDoc.bio/bannerUrl — same DB-edited-only
+  // story as points.
+  bio: string | null;
+  bannerUrl: string | null;
+  // See accountModels.ts's AccountDoc — auto-tracked by the signaling
+  // server, never hand-edited.
+  callSeconds: number;
+  micSeconds: number;
+  shareSeconds: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -120,6 +129,11 @@ function docToFullAccount(doc: AccountDoc): FullAccount {
     // Absent on accounts written before this field existed — same
     // "old data reads as the safe default" reasoning as `oauth` below.
     points: doc.points ?? 0,
+    bio: doc.bio ?? null,
+    bannerUrl: doc.bannerUrl ?? null,
+    callSeconds: doc.callSeconds ?? 0,
+    micSeconds: doc.micSeconds ?? 0,
+    shareSeconds: doc.shareSeconds ?? 0,
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
     passwordHash: doc.account.passwordHash ?? null,
@@ -151,6 +165,11 @@ async function persistNewAccount(account: FullAccount): Promise<void> {
       displayName: account.displayName,
       flags: account.flags,
       points: account.points,
+      bio: account.bio,
+      bannerUrl: account.bannerUrl,
+      callSeconds: account.callSeconds,
+      micSeconds: account.micSeconds,
+      shareSeconds: account.shareSeconds,
       account: {
         passwordHash: account.passwordHash,
         ips: account.ips,
@@ -234,6 +253,45 @@ export async function addAccountPoints(accountId: string, amount: number): Promi
   return account.points;
 }
 
+export interface CallStatsDelta {
+  callSeconds?: number;
+  micSeconds?: number;
+  shareSeconds?: number;
+}
+
+// Same $inc-over-read-modify-write reasoning as persistAccountPointsIncrement
+// above — a room switch, a mic toggle, and a disconnect can all close out a
+// segment for the same account within the same instant (different tabs, or
+// just unlucky timing), and every one of them has to add up.
+async function persistAccountCallStatsIncrement(id: string, delta: CallStatsDelta): Promise<void> {
+  if (MONGO_ENABLED) {
+    await connectMongo();
+    const inc: Record<string, number> = {};
+    if (delta.callSeconds) inc.callSeconds = delta.callSeconds;
+    if (delta.micSeconds) inc.micSeconds = delta.micSeconds;
+    if (delta.shareSeconds) inc.shareSeconds = delta.shareSeconds;
+    if (Object.keys(inc).length === 0) return;
+    await AccountModel.findOneAndUpdate({ id }, { $inc: inc, updatedAt: Date.now() });
+  } else {
+    saveToDisk();
+  }
+  void invalidateCachedAccount(id);
+}
+
+// Adds to an account's cumulative call/mic/share time — see
+// server/signaling.ts's flushClientStats, the only caller. Silently a no-op
+// for an account that no longer exists (the connection closing out a segment
+// for a since-deleted account has nowhere to credit it).
+export async function addAccountCallStats(accountId: string, delta: CallStatsDelta): Promise<void> {
+  const account = accountsById.get(accountId);
+  if (!account) return;
+  if (delta.callSeconds) account.callSeconds = (account.callSeconds ?? 0) + delta.callSeconds;
+  if (delta.micSeconds) account.micSeconds = (account.micSeconds ?? 0) + delta.micSeconds;
+  if (delta.shareSeconds) account.shareSeconds = (account.shareSeconds ?? 0) + delta.shareSeconds;
+  account.updatedAt = Date.now();
+  await persistAccountCallStatsIncrement(accountId, delta);
+}
+
 function indexAccount(account: FullAccount) {
   accountsById.set(account.id, account);
   accountsByUsername.set(fold(account.username), account.id);
@@ -254,6 +312,11 @@ export function toPublicAccount(account: FullAccount): PublicAccount {
     displayName: account.displayName,
     flags: account.flags,
     points: account.points ?? 0,
+    bio: account.bio ?? null,
+    bannerUrl: account.bannerUrl ?? null,
+    callSeconds: account.callSeconds ?? 0,
+    micSeconds: account.micSeconds ?? 0,
+    shareSeconds: account.shareSeconds ?? 0,
     createdAt: account.createdAt,
     updatedAt: account.updatedAt,
   };
@@ -456,6 +519,11 @@ export async function createAccount(
     displayName,
     flags,
     points: 0,
+    bio: null,
+    bannerUrl: null,
+    callSeconds: 0,
+    micSeconds: 0,
+    shareSeconds: 0,
     createdAt: now,
     updatedAt: now,
     passwordHash,
@@ -499,6 +567,11 @@ export async function createOAuthAccount(options: {
     displayName,
     flags: [],
     points: 0,
+    bio: null,
+    bannerUrl: null,
+    callSeconds: 0,
+    micSeconds: 0,
+    shareSeconds: 0,
     createdAt: now,
     updatedAt: now,
     passwordHash: null,

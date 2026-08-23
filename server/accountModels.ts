@@ -10,6 +10,19 @@ export interface AccountDoc {
   // database, which is also why it lives at the top level (not under
   // `account`) alongside the other fields a plain admin edit might touch.
   points: number;
+  // Public profile page content (see app/user/[id]/page.tsx) — same
+  // DB-edited-only story as `points` for now: nothing in the app writes
+  // these yet, they just render if someone sets them by hand.
+  bio: string | null;
+  bannerUrl: string | null;
+  // Cumulative time, in whole seconds, tracked automatically by the
+  // signaling server (see signaling.ts's flushClientStats) every time a
+  // call/mic/share segment closes — a room switch, a toggle off, or a
+  // disconnect. Unlike points/bio/bannerUrl, these are never hand-edited;
+  // they only ever grow.
+  callSeconds: number;
+  micSeconds: number;
+  shareSeconds: number;
   // Sensitive/internal — excluded from queries by default (see `select:
   // false` below), same intent as the whole-list `select("-_id")` pattern
   // in moderationStore.ts: never accidentally leak this into an API
@@ -63,6 +76,11 @@ const accountSchema = new Schema<AccountDoc>(
     displayName: { type: String, required: true },
     flags: { type: [String], default: [] },
     points: { type: Number, default: 0 },
+    bio: { type: String, default: null },
+    bannerUrl: { type: String, default: null },
+    callSeconds: { type: Number, default: 0 },
+    micSeconds: { type: Number, default: 0 },
+    shareSeconds: { type: Number, default: 0 },
     account: {
       type: new Schema(
         {
