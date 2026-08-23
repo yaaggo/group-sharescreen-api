@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { WebSocket } from "ws";
+import { randomInt } from "node:crypto";
 import {
   registerStatsProvider,
   wsConnectionsTotal,
@@ -32,6 +33,7 @@ import {
   deletePersistedChat,
   type ChatMessage,
 } from "./chatStore.js";
+import { loadRoomRecord, saveRoomRecord, deleteRoomRecord, type RoomRecord } from "./roomStore.js";
 import {
   loadPersistedAnnouncement,
   savePersistedAnnouncement,
@@ -124,6 +126,16 @@ function isPrivateRoom(room: string): boolean {
   return room.startsWith(PRIVATE_PREFIX);
 }
 
+// 6-digit code generated for every private room's RoomRecord (see
+// roomStore.ts) — nothing checks it yet (see RoomRecord's own doc comment),
+// so this is purely "have a real value ready" rather than a security
+// control. Cryptographically random anyway, on the assumption that it'll
+// gate something eventually and guessability will matter then even if it
+// doesn't now.
+function generateRoomCode(): string {
+  return randomInt(0, 1_000_000).toString().padStart(6, "0");
+}
+
 // A non-updated ("old format") client — and any guest before its very first
 // guest-token round-trip — never presents a token at all, so the only thing
 // it can offer to reclaim a stale connection is the plain clientId it was
@@ -209,7 +221,13 @@ interface ClientInfo {
   rateLimitKey: string;
 }
 
-interface RoomInfo {
+// Extends RoomRecord (ownerId/private/flags/code — see roomStore.ts) with
+// this process's own in-memory bookkeeping for the room. Keeping the
+// persisted fields as one embedded block, rather than spread loose among
+// the in-memory-only ones, is what lets leaveRoom's ownership handoff and
+// the "join" handler's room-creation save the *whole* persisted record back
+// with a plain object spread instead of having to know which fields matter.
+interface RoomInfo extends RoomRecord {
   sockets: Set<WebSocket>;
   createdAt: number;
   messages: ChatMessage[];
@@ -218,6 +236,17 @@ interface RoomInfo {
   // isSameOwner and the "join"/"register" handlers). Keyed the same way the
   // old global `namesInUse` map used to be (lowercased name -> holder).
   names: Map<string, WebSocket>;
+}
+
+// The stable identity a room's ownership is keyed on — an account's id if
+// logged in, otherwise the guest id minted for this connection in
+// "register". By the time "join" runs, info.name is required and only ever
+// gets set from "register", which always ends up populating one of the two
+// — the fallback to info.id (the ephemeral per-connection id) only matters
+// for a hypothetical connection that reached here without ever registering,
+// which the "join" handler already rejects before this could be called.
+function stableUserId(info: ClientInfo): string {
+  return info.accountId ?? info.guestId ?? info.id;
 }
 
 // Whether `challenger` may take over `existing`'s session/room slot — used
@@ -864,6 +893,7 @@ function scheduleRoomDeletion(room: string) {
     if (roomInfo && roomInfo.sockets.size === 0) {
       rooms.delete(room);
       deletePersistedChat(room);
+      void deleteRoomRecord(room);
     }
   }, ROOM_DELETION_GRACE_MS);
   roomDeletionTimers.set(room, timer);
@@ -885,6 +915,27 @@ function leaveRoom(info: ClientInfo) {
       // deliberately does NOT delete the file either, since that's not a
       // real departure — see detachSession's comment.)
       scheduleRoomDeletion(room);
+    } else if (roomInfo.ownerId === stableUserId(info)) {
+      // The owner left but the room isn't empty — hand ownership to
+      // whoever's been here longest of who's left. `sockets` is a Set,
+      // which preserves insertion order, so its first remaining entry is
+      // exactly that (modulo a reconnect re-inserting someone at the back —
+      // an accepted approximation, same spirit as isSameOwner's
+      // guest-identity heuristics elsewhere in this file). One extra Redis
+      // write for an event this rare (an owner actually leaving a room that
+      // still has people in it) is nothing next to what it'd cost to do
+      // this on every join instead.
+      const nextSocket = roomInfo.sockets.values().next().value;
+      const nextOwner = nextSocket ? clients.get(nextSocket) : undefined;
+      if (nextOwner) {
+        roomInfo.ownerId = stableUserId(nextOwner);
+        void saveRoomRecord(room, {
+          ownerId: roomInfo.ownerId,
+          private: roomInfo.private,
+          flags: roomInfo.flags,
+          code: roomInfo.code,
+        });
+      }
     }
   }
   info.room = null;
@@ -1816,17 +1867,38 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           info.mic = false;
           let roomInfo = rooms.get(room);
           if (!roomInfo) {
-            // Reloads any chat history still persisted (chatStore.ts) from
-            // before the room last emptied out or the process last
-            // restarted. Awaiting here means another client's "join" for
-            // this same brand-new room could land while we wait — re-check
-            // after, so we don't clobber a RoomInfo that landed first.
-            const messages = await loadPersistedChat(room);
+            // Reloads any chat history and RoomRecord still persisted
+            // (chatStore.ts/roomStore.ts) from before the room last emptied
+            // out or the process last restarted — run together since both
+            // are one round trip either way and this is the one point in
+            // the whole "join" path that ever touches either store; every
+            // later join into this same (now in-memory) room skips this
+            // block entirely. Awaiting here means another client's "join"
+            // for this same brand-new room could land while we wait —
+            // re-check after, so we don't clobber a RoomInfo that landed
+            // first.
+            const [messages, existingRecord] = await Promise.all([
+              loadPersistedChat(room),
+              loadRoomRecord(room),
+            ]);
             roomInfo = rooms.get(room);
             if (!roomInfo) {
-              roomInfo = { sockets: new Set(), createdAt: Date.now(), messages, names: new Map() };
+              // No prior record means this join is the one creating the
+              // room from scratch — this connection becomes its first
+              // owner, and private/flags/code get real starting values
+              // (see roomStore.ts's RoomRecord — none of it is enforced
+              // anywhere yet, just persisted).
+              const isPrivate = isPrivateRoom(room);
+              const record: RoomRecord = existingRecord ?? {
+                ownerId: stableUserId(info),
+                private: isPrivate,
+                flags: [],
+                code: isPrivate ? generateRoomCode() : null,
+              };
+              roomInfo = { sockets: new Set(), createdAt: Date.now(), messages, names: new Map(), ...record };
               rooms.set(room, roomInfo);
               roomsCreatedTotal.inc({ visibility: isPrivateRoom(room) ? "private" : "public" });
+              if (!existingRecord) void saveRoomRecord(room, record);
             }
           }
           // The await above gave this socket's own "leave"/another "join"
