@@ -106,6 +106,26 @@ const AUTO_BAN_DURATION_MINUTES = 60;
 // covers a real person hopping between a few rooms in one sitting while
 // still capping how long one solve keeps paying off for a bot.
 const TURNSTILE_REVERIFY_INTERVAL_MS = 10 * 60_000;
+// Wall-clock time this process came up — used only for the startup grace
+// window right below.
+const SERVER_START_TIME = Date.now();
+// A deploy/restart drops every open connection at once; every client's own
+// reconnect logic (see lib/signalingClient.ts's scheduleReconnect) brings
+// them all back within seconds of each other, and each one is a brand-new
+// socket with no info.turnstileVerifiedAt yet — so with TURNSTILE_ENABLED
+// on, a restart used to turn into every single reconnecting person being
+// challenged for a fresh token at once, right as the process is still
+// coming back up. For this long after start, a join that doesn't present a
+// token is let through anyway (same as TURNSTILE_ENABLED being off) — see
+// mustVerifyTurnstile below. A join that *does* present one is still fully
+// verified regardless, same principle as TURNSTILE_ENABLED's own doc
+// comment: there's no reason to wave through a client actively claiming to
+// have passed the challenge, restart or not. Comfortably covers a restart's
+// reconnect burst (seconds, not minutes) while being short enough that it's
+// not a standing way to skip verification — a bot would have to specifically
+// time itself to this narrow window after every deploy, and only gains
+// "no token required", not "not verified if one is sent".
+const TURNSTILE_STARTUP_GRACE_MS = 2 * 60_000;
 // Close code used to reject a connection from a banned IP — distinct from
 // SUPERSEDED_CLOSE_CODE below so the client can tell them apart and show the
 // right message instead of quietly retrying (see signalingClient.ts).
@@ -1822,7 +1842,23 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           // check being silently skipped — there's no backward-compat
           // reason to wave through a client that's actively claiming to have
           // passed the challenge.
-          const mustVerifyTurnstile = !turnstileStillFresh && (TURNSTILE_ENABLED || turnstileToken.length > 0);
+          //
+          // The post-restart grace window (TURNSTILE_STARTUP_GRACE_MS) is
+          // the one exception to that last part: within it, verification is
+          // skipped outright, token or no token. A restart's reconnect burst
+          // hits Cloudflare's siteverify with everyone's token at once, and
+          // a token that's genuinely valid can still come back *rejected*
+          // under that load (network hiccup, Cloudflare briefly slow to
+          // answer, VERIFY_TIMEOUT_MS in turnstile.ts tripping) —
+          // from this server's side that's indistinguishable from an actual
+          // failed challenge, so a client doing everything right would still
+          // get turnstile-required and, after MAX_JOIN_RETRIES, a dead end.
+          // Skipping the call entirely during the window sidesteps that
+          // false-rejection risk rather than trying to tell it apart from a
+          // real one.
+          const withinStartupGrace = Date.now() - SERVER_START_TIME < TURNSTILE_STARTUP_GRACE_MS;
+          const mustVerifyTurnstile =
+            !turnstileStillFresh && !withinStartupGrace && (TURNSTILE_ENABLED || turnstileToken.length > 0);
           if (mustVerifyTurnstile) {
             const verified = await verifyTurnstileToken(turnstileToken, info.ip);
             turnstileVerificationsTotal.inc({ result: verified ? "success" : "failure" });
