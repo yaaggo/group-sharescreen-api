@@ -25,6 +25,7 @@ import {
   refreshAccountFromMongo,
   getAccountConnections,
   isNameReserved,
+  getPublicAccountById,
   addAccountPoints,
   addAccountCallStats,
   USERNAME_RE,
@@ -68,10 +69,15 @@ import {
 } from "./supporterStore.js";
 import {
   isIpBanned,
-  isValidIp,
+  isBanned,
+  isValidBanValue,
   listBans,
+  countBans,
+  addBan,
+  removeBan,
   banIp,
   unbanIp,
+  type BanSubject,
   listBannedWords,
   setBannedWords,
   findBannedWord,
@@ -196,6 +202,20 @@ interface ClientInfo {
   name: string | null;
   room: string | null;
   sharing: boolean;
+  // Which of the two video channels this connection is actually
+  // broadcasting, as reported by the "sharing" message. `sharing` above
+  // stays what it has always been (screen || camera) so nothing that only
+  // cares "is this person transmitting" has to change; these exist so the
+  // admin panel can tell a screen share from a camera one.
+  //
+  // undefined means the client never reported the breakdown — an older
+  // client only ever sends the single boolean. That's deliberately distinct
+  // from `false`: "not sharing a camera" and "we don't know what they're
+  // sharing" are different answers, and the admin payload passes the
+  // difference through as null rather than flattening it into a wrong
+  // "screen" label.
+  sharingScreen?: boolean;
+  sharingCamera?: boolean;
   mic: boolean;
   isAlive: boolean;
   socket: WebSocket;
@@ -246,6 +266,14 @@ interface ClientInfo {
   // someone else's session.
   guestId?: string;
   guestVerified?: boolean;
+  // Hash of a handful of stable browser/device traits, computed client-side
+  // and sent with "register" (see the client's lib/fingerprint.ts). The
+  // point of banning on it is that it survives what the other two subjects
+  // don't: a new guest identity, a fresh account, a different IP. It is not
+  // a secret and not proof of anything — a modified client can withhold or
+  // fake it — so it's strictly an extra handle for moderation, never an
+  // identity anything is trusted on.
+  fingerprint?: string;
   // Stable per-connection key for the message-rate limiters in
   // rateLimiter.ts — set once at connect time and never touched again.
   // Deliberately *not* the same as `id`: `id` can be reassigned mid-life
@@ -1091,6 +1119,9 @@ function peerSummary(info: ClientInfo) {
     id: info.id,
     name: info.name,
     sharing: info.sharing,
+    // See ClientInfo.sharingScreen/sharingCamera — null when unknown.
+    screen: info.sharingScreen ?? null,
+    camera: info.sharingCamera ?? null,
     mic: info.mic,
     // Not logged into a registered account — the client renders this as a
     // "(guest)" suffix wherever the name is shown (see lib/displayName.ts).
@@ -1273,6 +1304,8 @@ function leaveRoom(info: ClientInfo) {
   }
   info.room = null;
   info.sharing = false;
+  info.sharingScreen = undefined;
+  info.sharingCamera = undefined;
   info.mic = false;
   broadcastToRoom(room, { type: "peer-left", id: info.id }, info.socket);
 }
@@ -1321,15 +1354,31 @@ function detachSession(info: ClientInfo) {
   info.socket.close(SUPERSEDED_CLOSE_CODE, "superseded-by-new-connection");
 }
 
-// Terminates every socket currently connected from `ip` — called right
-// after an admin bans it, so the ban takes effect immediately instead of
-// only blocking that IP's *next* connection attempt.
-function disconnectClientsByIp(ip: string) {
+// Terminates every socket currently matching a freshly-created ban — called
+// right after one is issued, so it takes effect immediately instead of only
+// blocking that subject's *next* connection or register.
+function disconnectBannedClients(subject: BanSubject, value: string) {
   for (const info of clients.values()) {
-    if (info.ip === ip) {
-      info.socket.close(BANNED_CLOSE_CODE, "ip-banned");
-    }
+    const matches =
+      subject === "ip"
+        ? info.ip === value
+        : subject === "account"
+          ? info.accountId === value
+          : info.fingerprint === value;
+    if (matches) info.socket.close(BANNED_CLOSE_CODE, `${subject}-banned`);
   }
+}
+
+function disconnectClientsByIp(ip: string) {
+  disconnectBannedClients("ip", ip);
+}
+
+// Absent means "ip": the ban endpoints predate subjects, and every caller
+// that doesn't name one is talking about an IP.
+function parseBanSubject(raw: unknown): BanSubject | null {
+  if (raw === undefined || raw === null || raw === "") return "ip";
+  if (raw === "ip" || raw === "account" || raw === "fingerprint") return raw;
+  return null;
 }
 
 // Tracks rate-limit *violations* (not hits — those are already counted by
@@ -1503,6 +1552,16 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     if (!account) {
       return reply.code(401).send({ error: "Usuário ou senha inválidos." });
     }
+    // A banned account is refused its token outright rather than being let
+    // in to fail later at "register" — the credentials are right, so saying
+    // "wrong password" would just be a lie, and handing out a token that
+    // can't be used anywhere is worse than none.
+    const ban = isBanned("account", account.id);
+    if (ban) {
+      return reply
+        .code(403)
+        .send({ error: ban.reason ? `Conta banida: ${ban.reason}` : "Conta banida." });
+    }
     const token = signToken({ sub: account.id, username: account.username, flags: account.flags });
     return { token, account };
   });
@@ -1518,6 +1577,15 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     if (!payload) return reply.code(401).send({ error: "unauthorized" });
     const account = await refreshAccountFromMongo(payload.sub);
     if (!account) return reply.code(401).send({ error: "unauthorized" });
+    // A banned account's session stops resolving here, which is what makes
+    // the ban stick no matter where the token came from — /auth/login refuses
+    // to issue one at all, but the OAuth callbacks (oauthRoutes.ts) hand one
+    // out at four different points, and every client bootstraps its session
+    // through this endpoint. Treated as an expired session rather than a
+    // distinct status: the client drops the token and shows a logged-out
+    // state, and the reason is delivered where it can actually be read (see
+    // the "banned" message in the WS register handler).
+    if (isBanned("account", account.id)) return reply.code(401).send({ error: "unauthorized" });
     // Which social providers this account can log in with, plus whether it
     // has a password at all — an account created through Discord/Google
     // doesn't (see accountStore.ts), and the client needs to know that to
@@ -1555,10 +1623,57 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
         isPrivate: isPrivateRoom(handle),
         createdAt: info.createdAt,
         peopleCount: realPeopleCount(info),
+        // Stable identity of whoever currently owns the room (see
+        // stableUserId / leaveRoom's ownership handoff): an accountId for a
+        // logged-in owner, a guest id otherwise. Sent so the admin panel can
+        // both tag the owner in the peer list and find a room by its owner's
+        // id even when that person isn't the one being searched by name.
+        ownerId: info.ownerId ?? null,
+        // 6-digit access code of a private room — nothing gates entry on it
+        // yet (see roomStore.ts's RoomRecord.code), but a moderator looking
+        // for "the private room someone gave me the code to" has no other
+        // way to find it.
+        code: info.code ?? null,
+        // Room video sources (see RoomVideoSource) are attributed to whoever
+        // added them, so the per-peer count below is what the admin panel
+        // filters on — this total is just the room-level summary.
+        videoSourceCount: info.videoSources.length,
         peers: [...info.sockets]
           .map((s) => clients.get(s))
           .filter((c): c is ClientInfo => c !== undefined && !c.isModerator)
-          .map((c) => ({ id: c.id, name: c.name, sharing: c.sharing, mic: c.mic, ip: c.ip, isGuest: !c.accountId })),
+          .map((c) => ({
+            id: c.id,
+            name: c.name,
+            sharing: c.sharing,
+            // Per-channel breakdown of `sharing` — see
+            // ClientInfo.sharingScreen. null means an older client that
+            // never told us which of the two it is.
+            screen: c.sharingScreen ?? null,
+            camera: c.sharingCamera ?? null,
+            // How many of the room's video sources this person put there.
+            // Keyed on stableUserId, the same identity RoomVideoSource
+            // records in addedById — not the connection id, which changes
+            // on every reconnect.
+            videoSources: info.videoSources.filter((v) => v.addedById === stableUserId(c)).length,
+            mic: c.mic,
+            ip: c.ip,
+            isGuest: !c.accountId,
+            // Everything below exists purely so the admin panel's search can
+            // find a room by *who's in it*. `name` alone isn't enough: an
+            // account's display name can differ from its username, and a
+            // guest's name is whatever they typed this session, so neither
+            // is a reliable handle for "find this person's room".
+            accountId: c.accountId ?? null,
+            username: c.accountId ? getPublicAccountById(c.accountId)?.username ?? null : null,
+            // Persists across a guest's reconnects (see the "register"
+            // handler's guest token) — the closest thing to a stable id a
+            // non-account visitor has.
+            guestId: c.guestId ?? null,
+            // See ClientInfo.fingerprint. null for a client that never sent
+            // one (an outdated one, or one that strips it) — the panel just
+            // doesn't offer the browser-ban button for those.
+            fingerprint: c.fingerprint ?? null,
+          })),
       }))
       .sort((a, b) => b.peopleCount - a.peopleCount || a.createdAt - b.createdAt);
     return { rooms: allRooms };
@@ -1906,21 +2021,29 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       sharingCount,
       publicRooms,
       privateRooms,
-      bannedIps: listBans().length,
+      bannedIps: countBans("ip"),
+      bannedAccounts: countBans("account"),
+      bannedFingerprints: countBans("fingerprint"),
       bannedWords: listBannedWords().length,
       mongo: { enabled: MONGO_ENABLED, connected: isMongoConnected() },
     };
   });
 
-  // IP ban list/management. Banning takes effect immediately: any socket
-  // currently connected from that IP is disconnected right away (see
-  // disconnectClientsByIp), and every future "/ws" upgrade from it is
-  // rejected before it's ever added to `clients` — see the handler below.
+  // Ban list/management, for all three subjects (see moderationStore.ts's
+  // BanSubject). Banning takes effect immediately: any socket currently
+  // matching is disconnected right away (see disconnectBannedClients). An IP
+  // ban is additionally enforced at the "/ws" upgrade itself, before the
+  // connection is ever added to `clients`; the other two can't be — neither
+  // the account nor the fingerprint is known until "register" — so those are
+  // enforced there instead.
   app.get("/admin/bans", { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
-    return { bans: listBans() };
+    // `ip` is a legacy alias for `value`, kept so an admin panel left open
+    // across the deploy that added subjects still renders its list instead
+    // of a column of "undefined".
+    return { bans: listBans().map((ban) => ({ ...ban, ip: ban.value })) };
   });
 
   app.post("/admin/bans", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
@@ -1928,20 +2051,53 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       return reply.code(401).send({ error: "unauthorized" });
     }
     const body = (request.body ?? {}) as Record<string, unknown>;
-    const ip = typeof body.ip === "string" ? body.ip.trim() : "";
+    const subject = parseBanSubject(body.subject);
+    if (!subject) {
+      return reply.code(400).send({ error: "Tipo de banimento inválido." });
+    }
+    // `ip` is still accepted as the value field for an IP ban — that's what
+    // every caller sent before this endpoint knew about other subjects.
+    const rawValue = typeof body.value === "string" ? body.value : typeof body.ip === "string" ? body.ip : "";
+    const value = rawValue.trim();
     const reason = typeof body.reason === "string" ? body.reason.trim().slice(0, BAN_REASON_MAX_LEN) : "";
     const durationMinutes =
       typeof body.durationMinutes === "number" && Number.isFinite(body.durationMinutes) && body.durationMinutes > 0
         ? body.durationMinutes
         : null;
-    if (!isValidIp(ip)) {
-      return reply.code(400).send({ error: "IP inválido." });
+    if (!isValidBanValue(subject, value)) {
+      return reply.code(400).send({
+        error:
+          subject === "ip"
+            ? "IP inválido."
+            : subject === "account"
+              ? "Id de conta inválido."
+              : "Fingerprint inválido.",
+      });
     }
-    const ban = await banIp(ip, reason, durationMinutes);
-    disconnectClientsByIp(ip);
-    return { ban };
+    const ban = await addBan(subject, value, reason, durationMinutes);
+    disconnectBannedClients(subject, value);
+    return { ban: { ...ban, ip: ban.value } };
   });
 
+  app.delete(
+    "/admin/bans/:subject/:value",
+    { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      if (!requireAdmin(request)) {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
+      const params = request.params as { subject: string; value: string };
+      const subject = parseBanSubject(params.subject);
+      if (!subject) {
+        return reply.code(400).send({ error: "Tipo de banimento inválido." });
+      }
+      await removeBan(subject, params.value);
+      return reply.code(204).send();
+    }
+  );
+
+  // Legacy single-segment form, from before bans had subjects — always an
+  // IP, since that's all this route could ever have been used for.
   app.delete("/admin/bans/:ip", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
     if (!requireAdmin(request)) {
       return reply.code(401).send({ error: "unauthorized" });
@@ -2087,6 +2243,40 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           const rawToken = typeof msg.token === "string" ? msg.token : "";
           const authPayload = rawToken ? verifyToken(rawToken) : null;
           const isAccountToken = Boolean(authPayload && !authPayload.guest);
+
+          // Browser fingerprint (see ClientInfo.fingerprint). Recorded on
+          // every register — it's the same value each time for a given
+          // browser, so re-sending it is how a connection that opened before
+          // the client had computed it still ends up identified.
+          const rawFingerprint = typeof msg.fingerprint === "string" ? msg.fingerprint : "";
+          if (rawFingerprint && isValidBanValue("fingerprint", rawFingerprint)) {
+            info.fingerprint = rawFingerprint;
+          }
+          // The two bans that can't be enforced at connection time the way an
+          // IP ban is: neither the account nor the fingerprint is known until
+          // this message arrives. Closing (rather than just refusing the
+          // name) is what stops the client from retrying forever — the close
+          // code puts it in the same "banned" state an IP ban does.
+          const fingerprintBan = isBanned("fingerprint", info.fingerprint);
+          const accountBan = isAccountToken ? isBanned("account", authPayload!.sub) : null;
+          const identityBan = accountBan ?? fingerprintBan;
+          if (identityBan) {
+            registerErrorsTotal.inc();
+            // A dedicated message rather than a "register-error": this isn't
+            // something a different name would fix, and the close that
+            // follows is what the client actually reacts to. Sending the
+            // moderator's own reason lets it say *why* instead of falling
+            // back to the generic auto-ban wording (an IP ban has no
+            // equivalent — it's rejected at the "/ws" upgrade, before there's
+            // a client to tell anything to).
+            send(socket, {
+              type: "banned",
+              subject: identityBan.subject,
+              reason: identityBan.reason || null,
+            });
+            socket.close(BANNED_CLOSE_CODE, `${identityBan.subject}-banned`);
+            return;
+          }
 
           // A logged-in account's display name always comes from its own
           // account record, never from whatever the client sends alongside
@@ -2350,6 +2540,8 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           clearRoomDeletionTimer(room);
           info.room = room;
           info.sharing = false;
+          info.sharingScreen = undefined;
+          info.sharingCamera = undefined;
           info.mic = false;
           // Starts this connection's call-time segment (see
           // flushClientStats) — never for a moderator's admin-join ghost
@@ -2475,6 +2667,8 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           info.name = info.name ?? "Moderador";
           info.room = room;
           info.sharing = false;
+          info.sharingScreen = undefined;
+          info.sharingCamera = undefined;
           info.mic = false;
           roomInfo.sockets.add(socket);
           const adminPeers = [...roomInfo.sockets]
@@ -2488,6 +2682,13 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             selfId: info.id,
             peers: adminPeers,
             messages: roomInfo.messages,
+            // Same list a regular participant gets on "join". A moderator
+            // doesn't embed the videos, but it does need to know who put one
+            // there — that's a third kind of "transmitting" the moderation
+            // UI has to be able to tell apart from a screen or camera share.
+            // The later video-source-added/removed broadcasts already reach
+            // this socket like any other room member's.
+            videoSources: roomInfo.videoSources,
           });
           flushPendingSignals(info);
           broadcastToRoom(
@@ -2514,7 +2715,12 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           // transient toggle state, not a one-shot user action — the next
           // real toggle just propagates normally once the window resets.
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
-          const nextSharing = Boolean(msg.sharing);
+          // `screen`/`camera` are the per-channel breakdown (see
+          // ClientInfo.sharingScreen); an older client sends neither and
+          // only ever sets `sharing`. Either one being true also counts as
+          // sharing on its own, so a client that ever stops sending the
+          // rolled-up boolean still can't end up marked as not sharing.
+          const nextSharing = Boolean(msg.sharing) || Boolean(msg.screen) || Boolean(msg.camera);
           // Opens/closes this connection's share-time segment (see
           // flushClientStats) — turning on starts the timer (only if it
           // wasn't already running, so a duplicate "sharing:true" is a
@@ -2531,7 +2737,22 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             }
           }
           info.sharing = nextSharing;
-          broadcastToRoom(info.room, { type: "peer-sharing", id: info.id, sharing: info.sharing });
+          if (typeof msg.screen === "boolean" || typeof msg.camera === "boolean") {
+            info.sharingScreen = Boolean(msg.screen);
+            info.sharingCamera = Boolean(msg.camera);
+          } else {
+            // Nothing to go on — back to "unknown" rather than keeping a
+            // breakdown this message never confirmed.
+            info.sharingScreen = undefined;
+            info.sharingCamera = undefined;
+          }
+          broadcastToRoom(info.room, {
+            type: "peer-sharing",
+            id: info.id,
+            sharing: info.sharing,
+            screen: info.sharingScreen ?? null,
+            camera: info.sharingCamera ?? null,
+          });
           break;
         }
         case "mic": {
