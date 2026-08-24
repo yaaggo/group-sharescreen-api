@@ -196,6 +196,31 @@ function roomCodeFromHandle(room: string): string | null {
   return match ? match[1] : null;
 }
 
+// Whether a private room is *required* to carry its code in its handle.
+//
+// Defaults to "false", and that default is the whole point: the code-in-the-
+// handle scheme is new, and turning it on the moment this server deploys
+// would break two groups of people at once.
+//
+// Old clients don't know to generate a code, so every private room they ask
+// for is code-less ("priv-familia"). Enforcing would refuse those joins —
+// meaning a client that was working fine a minute before the deploy stops
+// being able to enter a room, which is not something a server update gets
+// to do to someone.
+//
+// New clients hitting old rooms is the mirror image: every private room
+// created before this scheme existed is code-less and stays that way, so a
+// strict client would lock people out of rooms they have used for months.
+// The client reads its own copy of this flag for exactly that reason (see
+// the web app's roomsApi.ts) and keeps accepting a bare name while it's off.
+//
+// While off, a code-less private handle still works everywhere and gets a
+// generated code stored on its record (see the "join" handler), same as
+// before. Flip it to "true" once enough time has passed that both sides
+// have turned over, and a private room without a code in its handle stops
+// being a thing this server will open.
+const ENFORCE_NEW_ROOM_CODE_SYSTEM = process.env.ENFORCE_NEW_ROOM_CODE_SYSTEM === "true";
+
 // A non-updated ("old format") client — and any guest before its very first
 // guest-token round-trip — never presents a token at all, so the only thing
 // it can offer to reclaim a stale connection is the plain clientId it was
@@ -2540,6 +2565,23 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           const room = typeof msg.room === "string" ? msg.room : "";
           if (!HANDLE_RE.test(room)) {
             send(socket, { type: "error", message: "Sala inválida." });
+            return;
+          }
+          // Only once the code-in-the-handle scheme is being enforced — see
+          // ENFORCE_NEW_ROOM_CODE_SYSTEM, which is off precisely so that
+          // this doesn't fire for old clients or for rooms that predate it.
+          // Deliberately not applied to "admin-join" below: a moderator
+          // still has to be able to look into a legacy room, and that path
+          // never creates one anyway.
+          if (
+            ENFORCE_NEW_ROOM_CODE_SYSTEM &&
+            isPrivateRoom(room) &&
+            !roomCodeFromHandle(room)
+          ) {
+            send(socket, {
+              type: "join-error",
+              message: "Sala privada precisa do código no fim do nome.",
+            });
             return;
           }
           if (info.room === room) return;
