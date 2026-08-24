@@ -118,16 +118,55 @@ const MAX_SUPPORTERS = 500;
 const AUTO_BAN_VIOLATION_LIMIT = 6;
 const AUTO_BAN_VIOLATION_WINDOW_MS = 60_000;
 const AUTO_BAN_DURATION_MINUTES = 60;
-// How long a passed Turnstile challenge is remembered per connection (see
-// ClientInfo.turnstileVerifiedAt) before the next join requires a fresh one
-// again — without an expiry, a single solved challenge would cover that
-// connection's joins forever (a WS socket doesn't expire on its own, and a
+// How long a passed Turnstile challenge is remembered before the next join
+// requires a fresh one again — without an expiry, a single solved challenge
+// would cover joins forever (a WS socket doesn't expire on its own, and a
 // scripted client answers heartbeat pings same as a browser), letting a bot
 // pay for one challenge and then spam indefinitely at just-under-rate-limit
-// pace without ever tripping the auto-ban above. 10 minutes comfortably
-// covers a real person hopping between a few rooms in one sitting while
-// still capping how long one solve keeps paying off for a bot.
-const TURNSTILE_REVERIFY_INTERVAL_MS = 10 * 60_000;
+// pace without ever tripping the auto-ban above.
+//
+// Was 10 minutes, on the reasoning that it "comfortably covers a real person
+// hopping between a few rooms in one sitting". A sitting is routinely longer
+// than that — people leave a room open for a film, a match, a call — so the
+// window was expiring mid-session and re-challenging someone who had done
+// nothing but stay. 30 still caps how long one solve keeps paying off.
+const TURNSTILE_REVERIFY_INTERVAL_MS = 30 * 60_000;
+// The same memory, kept per IP instead of per connection — and the reason
+// people were seeing far more challenges than the interval above suggests.
+//
+// ClientInfo.turnstileVerifiedAt lives and dies with one WebSocket, and this
+// app reconnects constantly through no fault of the user: a phone changing
+// networks, a laptop waking up, a backgrounded tab, a deploy. Every one of
+// those is a brand-new socket with an empty verification, so someone who
+// solved a challenge ninety seconds ago got another one — the interval never
+// even came into it.
+//
+// Keying on IP is what makes a reconnect free, since that is the one thing
+// that survives it (and it is already what the challenge is scoped to — see
+// verifyTurnstileToken's second argument). The trade is that people sharing
+// an address share a pass, which is acceptable for a spam gate rather than
+// an auth gate: the rate limiters and auto-ban above are per-IP too, so a
+// shared address was always a shared budget here.
+const turnstileVerifiedIps = new Map<string, number>();
+
+function markTurnstileVerified(ip: string) {
+  turnstileVerifiedIps.set(ip, Date.now());
+}
+
+function isTurnstileFreshForIp(ip: string): boolean {
+  const at = turnstileVerifiedIps.get(ip);
+  return at !== undefined && Date.now() - at < TURNSTILE_REVERIFY_INTERVAL_MS;
+}
+
+// Dropped on the existing heartbeat sweep rather than on write: an entry is
+// two small values, but one per IP with nothing ever removing them is an
+// unbounded map on a long-lived process.
+function pruneTurnstileVerifiedIps() {
+  const now = Date.now();
+  for (const [ip, at] of turnstileVerifiedIps) {
+    if (now - at >= TURNSTILE_REVERIFY_INTERVAL_MS) turnstileVerifiedIps.delete(ip);
+  }
+}
 // Wall-clock time this process came up — used only for the startup grace
 // window right below.
 const SERVER_START_TIME = Date.now();
@@ -1526,6 +1565,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
   // connection in the first place.
   const heartbeat = setInterval(() => {
     const now = Date.now();
+    pruneTurnstileVerifiedIps();
     for (const [targetId, queue] of pendingSignals) {
       const fresh = queue.filter((item) => now - item.queuedAt <= PENDING_SIGNAL_TTL_MS);
       if (fresh.length === 0) pendingSignals.delete(targetId);
@@ -2599,9 +2639,14 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           // Cloudflare), so re-validate afterwards in case this socket moved
           // on (closed, or a second "join" already landed — see the
           // loadPersistedChat comment below for why that's possible).
+          // Either this socket passed recently, or this address did — see
+          // turnstileVerifiedIps for why the second one carries the weight
+          // here: a reconnect always arrives with an empty per-socket value,
+          // and reconnects are constant and not the user's doing.
           const turnstileStillFresh =
-            info.turnstileVerifiedAt !== undefined &&
-            Date.now() - info.turnstileVerifiedAt < TURNSTILE_REVERIFY_INTERVAL_MS;
+            (info.turnstileVerifiedAt !== undefined &&
+              Date.now() - info.turnstileVerifiedAt < TURNSTILE_REVERIFY_INTERVAL_MS) ||
+            isTurnstileFreshForIp(info.ip);
           const turnstileToken = typeof msg.turnstileToken === "string" ? msg.turnstileToken : "";
           // While TURNSTILE_ENABLED is off, a token is never *required* — an
           // older client that's never heard of Turnstile sends nothing at
@@ -2640,6 +2685,10 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
               return;
             }
             info.turnstileVerifiedAt = Date.now();
+            // Remembered against the address too, so the next reconnect —
+            // which gets a fresh ClientInfo and would otherwise be
+            // challenged again immediately — doesn't pay for this twice.
+            markTurnstileVerified(info.ip);
             if (!clients.has(socket) || info.room === room) return;
           }
 
