@@ -302,29 +302,34 @@ interface ClientInfo {
 // the "join" handler's room-creation save the *whole* persisted record back
 // with a plain object spread instead of having to know which fields matter.
 // A video someone added to the room from an external service — a YouTube
-// video or livestream today, the `kind` tag is what keeps room for the next
-// one. It is *not* a WebRTC transmission: nothing streams through this
-// server or between peers. Every client embeds the same video itself, and
-// what actually travels is this little record — which video, whether it's
-// playing, and where it is — so that everyone's player lands on the same
-// frame. Room-scoped and in-memory, exactly like the peer list: a source
-// belongs to a room while that room exists (see the deletion grace period)
-// and is gone with it.
+// video/livestream or a Twitch channel today, the `kind` tag is what keeps
+// room for the next one. It is *not* a WebRTC transmission: nothing streams
+// through this server or between peers. Every client embeds the same video
+// itself, and what actually travels is this little record — which video,
+// whether it's playing, and where it is — so that everyone's player lands
+// on the same frame. Room-scoped and in-memory, exactly like the peer list:
+// a source belongs to a room while that room exists (see the deletion grace
+// period) and is gone with it.
 export interface RoomVideoSource {
   id: string;
-  kind: "youtube";
-  // The 11-character YouTube id, never the URL someone pasted: parsed and
-  // validated here (see parseYouTubeVideoId) so no client can talk another
-  // client's iframe into loading an arbitrary address.
+  kind: "youtube" | "twitch";
+  // The 11-character YouTube id for a "youtube" source, or the channel login
+  // for a "twitch" one — never the URL someone pasted: parsed and validated
+  // here (see parseYouTubeVideoId/parseTwitchChannel) so no client can talk
+  // another client's embed into loading an arbitrary address.
   videoId: string;
-  // Who may steer it: the "video-source-state" handler accepts play/pause/
-  // seek only from this identity (stableUserId), so what everyone sees is
-  // one person's playback rather than a tug of war. Removing it is
-  // restricted the same way, and it is dropped automatically when this
-  // person leaves the room (see leaveRoom) — everyone else can only hide it
-  // for themselves, which never reaches this server.
+  // Whoever added it — always the one "video-source-remove" and the
+  // leaveRoom cleanup below key off, regardless of controlMode. Steering
+  // (play/pause/seek, in the "video-source-state" handler) is keyed off this
+  // *unless* controlMode is "anyone", in which case anyone in the room may.
   addedById: string;
   addedByName: string;
+  // "owner" (the default, and the only mode before this field existed) means
+  // only addedById may play/pause/seek — everyone else's player just follows
+  // along, one person's playback rather than a tug of war. "anyone" opens
+  // that up to the whole room, for a source someone added expecting to share
+  // the wheel rather than hand out a read-only copy.
+  controlMode: "owner" | "anyone";
   playing: boolean;
   // Playback speed, shared like everything else here — and part of the
   // position arithmetic, not just a display setting: at 1.5x a video covers
@@ -461,6 +466,33 @@ function parseYouTubeVideoId(raw: string): string | null {
     }
   }
   return id && YOUTUBE_VIDEO_ID_RE.test(id) ? id : null;
+}
+
+// Twitch login names: 4-25 characters, letters/digits/underscore, never
+// starting with a digit — Twitch's own registration rule, which doubles here
+// as the shape check for a bare channel name typed with no URL at all.
+const TWITCH_CHANNEL_RE = /^[A-Za-z][A-Za-z0-9_]{3,24}$/;
+
+// Only a channel — the live broadcast, which is the only thing this room
+// knows how to keep a room synchronized on (see RoomVideoSource.controlMode
+// and the client's isLiveBroadcast: there is no timeline to seek a channel
+// embed to, only play/pause). A VOD or clip URL has more path segments than
+// a channel's `/<name>` and is deliberately rejected rather than guessed at.
+function parseTwitchChannel(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (TWITCH_CHANNEL_RE.test(trimmed)) return trimmed;
+  let url: URL;
+  try {
+    url = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`);
+  } catch {
+    return null;
+  }
+  const host = url.hostname.replace(/^www\./, "").replace(/^m\./, "").toLowerCase();
+  if (host !== "twitch.tv") return null;
+  const segments = url.pathname.split("/").filter(Boolean);
+  if (segments.length !== 1) return null;
+  const channel = segments[0];
+  return TWITCH_CHANNEL_RE.test(channel) ? channel : null;
 }
 
 function hasOwn(obj: Record<string, unknown>, key: string): boolean {
@@ -2790,17 +2822,23 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             });
             return;
           }
-          const videoId = parseYouTubeVideoId(typeof msg.url === "string" ? msg.url : "");
+          const kind = msg.kind === "twitch" ? "twitch" : "youtube";
+          const rawUrl = typeof msg.url === "string" ? msg.url : "";
+          const videoId = kind === "twitch" ? parseTwitchChannel(rawUrl) : parseYouTubeVideoId(rawUrl);
           if (!videoId) {
-            send(socket, { type: "error", message: "Link do YouTube inválido." });
+            send(socket, {
+              type: "error",
+              message: kind === "twitch" ? "Link da Twitch inválido." : "Link do YouTube inválido.",
+            });
             return;
           }
           const source: RoomVideoSource = {
             id: genId(),
-            kind: "youtube",
+            kind,
             videoId,
             addedById: stableUserId(info),
             addedByName: info.name,
+            controlMode: msg.controlMode === "anyone" ? "anyone" : "owner",
             // Starts playing: someone who just added a video meant to watch
             // it, and a source that arrives paused at 0 makes everyone wait
             // for whoever added it to press play again.
@@ -2843,13 +2881,15 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           const id = typeof msg.id === "string" ? msg.id : "";
           const source = roomInfo.videoSources.find((v) => v.id === id);
           if (!source) return;
-          // Only whoever added it drives. Enforced here and not just in the
-          // UI: everyone else's player is following this record, so a client
-          // that decided to send anyway would be steering other people's
-          // screens. Silently ignored rather than answered with an error —
-          // the sender's own player is already blocked from reaching this,
-          // so anything arriving here is not an honest mistake.
-          if (source.addedById !== stableUserId(info)) return;
+          // Whoever added it drives — or, if they set controlMode to
+          // "anyone" when adding it, anyone in the room does. Enforced here
+          // and not just in the UI: everyone else's player is following this
+          // record, so a client that decided to send anyway would be
+          // steering other people's screens. Silently ignored rather than
+          // answered with an error — a client honoring canControl is already
+          // blocked from reaching this, so anything arriving here that isn't
+          // covered by controlMode is not an honest mistake.
+          if (source.controlMode !== "anyone" && source.addedById !== stableUserId(info)) return;
           const rawPosition = typeof msg.positionSeconds === "number" ? msg.positionSeconds : NaN;
           source.positionSeconds =
             Number.isFinite(rawPosition) && rawPosition > 0 ? Math.min(rawPosition, 24 * 60 * 60) : 0;
