@@ -168,14 +168,32 @@ function isPrivateRoom(room: string): boolean {
   return room.startsWith(PRIVATE_PREFIX);
 }
 
-// 6-digit code generated for every private room's RoomRecord (see
-// roomStore.ts) — nothing checks it yet (see RoomRecord's own doc comment),
-// so this is purely "have a real value ready" rather than a security
-// control. Cryptographically random anyway, on the assumption that it'll
-// gate something eventually and guessability will matter then even if it
-// doesn't now.
+// 6-digit code generated for a private room's RoomRecord (see roomStore.ts)
+// when the handle doesn't already carry one — see roomCodeFromHandle below,
+// which is now where the code normally comes from. Cryptographically random,
+// on the assumption that it'll gate something eventually and guessability
+// will matter then even if it doesn't now.
 function generateRoomCode(): string {
   return randomInt(0, 1_000_000).toString().padStart(6, "0");
+}
+
+// A private room's code lives in its own handle: "priv-<nome>-<123456>".
+// The client mints it when creating the room (see the home page's private
+// "Criar sala"), which is what makes the room's URL the whole of its
+// secret — hand someone the link and they're in, with nothing else to pass
+// along and nothing for this server to hand back out.
+//
+// Parsed rather than generated here so the two can never disagree: a URL
+// typed or pasted straight into the browser creates exactly the room it
+// names, code included, instead of a room whose stored code is some other
+// number nobody has seen. Falls back to generateRoomCode() only for a
+// private handle with no trailing code at all — every such room predates
+// this scheme, and inventing one keeps the record's shape honest.
+const PRIVATE_ROOM_CODE_RE = /-(\d{6})$/;
+
+function roomCodeFromHandle(room: string): string | null {
+  const match = PRIVATE_ROOM_CODE_RE.exec(room);
+  return match ? match[1] : null;
 }
 
 // A non-updated ("old format") client — and any guest before its very first
@@ -1537,6 +1555,44 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     return { rooms: publicRooms };
   });
 
+  // Does this exact room exist? Two callers on the home page, wanting
+  // opposite things from the same answer.
+  //
+  // The public room field asks as you type (debounced), purely so the
+  // button can say "Criar sala" or "Entrar na sala" before it's pressed —
+  // for a public room the two are the same click, and only the wording
+  // tells you which one you're about to do.
+  //
+  // Private "Entrar em sala" asks on submit, where it's load-bearing:
+  // joining a room that isn't there *creates* it, so without this a
+  // mistyped digit silently opens a brand-new room and the person sits
+  // alone in it wondering where everyone is.
+  //
+  // Answers for public and private rooms alike, but only ever about a
+  // handle the caller already spelled out in full: for a private room that
+  // means already knowing name *and* code, which is the same thing that
+  // gets you in the door anyway (see roomCodeFromHandle) — so this hands
+  // back nothing that joining wouldn't. The limit still matters, and is why
+  // the typing-driven check is deliberately public-only on the client: it
+  // keeps this from being a cheap way to sweep the code space for a name
+  // someone has guessed.
+  app.get<{ Params: { handle: string } }>(
+    "/rooms/:handle/exists",
+    { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      const handle = request.params.handle;
+      if (!HANDLE_RE.test(handle)) {
+        return reply.code(400).send({ error: "Nome de sala inválido." });
+      }
+      // In memory means people are in it right now; a persisted record
+      // means it existed and emptied out (the room is recreated with its
+      // history intact on the next join — see the "join" handler), which
+      // for someone holding the link is just as much "this room exists".
+      if (rooms.has(handle)) return { exists: true };
+      return { exists: (await loadRoomRecord(handle)) !== null };
+    }
+  );
+
   // Account system: create/login work for anyone, no auth required going
   // in. Admin is no longer a separate Basic-Auth credential (see the old
   // adminAuth.ts) — it's just an account whose flags include "ADMIN" (see
@@ -2607,7 +2663,10 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
                 ownerId: stableUserId(info),
                 private: isPrivate,
                 flags: [],
-                code: isPrivate ? generateRoomCode() : null,
+                // From the handle itself when it carries one (see
+                // roomCodeFromHandle) — the client generated it, and the
+                // URL is what everyone shares.
+                code: isPrivate ? roomCodeFromHandle(room) ?? generateRoomCode() : null,
               };
               roomInfo = {
                 sockets: new Set(),
