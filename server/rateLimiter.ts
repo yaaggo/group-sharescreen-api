@@ -122,6 +122,14 @@ export const wsSignalLimiter = new RateLimiterMemory({ points: 1500, duration: 5
 // enough to allow a bit of rapid double-toggling without dropping it.
 export const wsToggleLimiter = new RateLimiterMemory({ points: 20, duration: 10 });
 
+// Play/pause/seek on a room video source. Its own budget, and a much larger
+// one, because scrubbing is not a "toggle": dragging along a progress bar
+// produces a burst of state changes, and every one of them dropped is a
+// second of the room watching a different frame. The client coalesces those
+// bursts before they get here (see VideoSourceTile), so this ceiling is for
+// the pathological case, not the normal one.
+export const wsVideoSourceLimiter = new RateLimiterMemory({ points: 60, duration: 10 });
+
 // Consumes one point from `limiter` for `key`; returns false (and bumps the
 // `sharescreen_ws_rate_limited_total{kind}` counter) instead of throwing
 // when the budget is exhausted, so call sites can use it as a plain

@@ -86,6 +86,7 @@ import {
   wsChatLimiter,
   wsSignalLimiter,
   wsToggleLimiter,
+  wsVideoSourceLimiter,
   consumeRateLimit,
 } from "./rateLimiter.js";
 
@@ -272,10 +273,51 @@ interface ClientInfo {
 // the in-memory-only ones, is what lets leaveRoom's ownership handoff and
 // the "join" handler's room-creation save the *whole* persisted record back
 // with a plain object spread instead of having to know which fields matter.
+// A video someone added to the room from an external service — a YouTube
+// video or livestream today, the `kind` tag is what keeps room for the next
+// one. It is *not* a WebRTC transmission: nothing streams through this
+// server or between peers. Every client embeds the same video itself, and
+// what actually travels is this little record — which video, whether it's
+// playing, and where it is — so that everyone's player lands on the same
+// frame. Room-scoped and in-memory, exactly like the peer list: a source
+// belongs to a room while that room exists (see the deletion grace period)
+// and is gone with it.
+export interface RoomVideoSource {
+  id: string;
+  kind: "youtube";
+  // The 11-character YouTube id, never the URL someone pasted: parsed and
+  // validated here (see parseYouTubeVideoId) so no client can talk another
+  // client's iframe into loading an arbitrary address.
+  videoId: string;
+  // Who may steer it: the "video-source-state" handler accepts play/pause/
+  // seek only from this identity (stableUserId), so what everyone sees is
+  // one person's playback rather than a tug of war. Removing it is
+  // restricted the same way, and it is dropped automatically when this
+  // person leaves the room (see leaveRoom) — everyone else can only hide it
+  // for themselves, which never reaches this server.
+  addedById: string;
+  addedByName: string;
+  playing: boolean;
+  // Playback speed, shared like everything else here — and part of the
+  // position arithmetic, not just a display setting: at 1.5x a video covers
+  // 1.5 seconds per second, so a client extrapolating without it drifts
+  // further out the longer it plays.
+  playbackRate: number;
+  // Where the video was at `updatedAt`. Clients extrapolate from the pair
+  // (see the client's videoSourcePosition) rather than being told a position
+  // continuously — a playing video's position is a function of time, so
+  // sending it repeatedly would be sending something both sides can compute.
+  positionSeconds: number;
+  // This server's clock, so everyone extrapolates from the same origin.
+  updatedAt: number;
+}
+
 interface RoomInfo extends RoomRecord {
   sockets: Set<WebSocket>;
   createdAt: number;
   messages: ChatMessage[];
+  // See RoomVideoSource. Capped at MAX_ROOM_VIDEO_SOURCES.
+  videoSources: RoomVideoSource[];
   // Room-scoped display-name reservations — separate from any other room,
   // so the same name can be used freely in two different rooms at once (see
   // isSameOwner and the "join"/"register" handlers). Keyed the same way the
@@ -358,6 +400,56 @@ function announcementStatsSummary() {
 
 const clients = new Map<WebSocket, ClientInfo>();
 const clientsById = new Map<string, ClientInfo>();
+// Enough for "the stream we're all watching" plus a couple of extras, few
+// enough that nobody can bury a room's own transmissions under a wall of
+// embedded players.
+const MAX_ROOM_VIDEO_SOURCES = 4;
+const YOUTUBE_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+
+// Accepts anything someone is likely to paste — a watch URL, youtu.be, an
+// embed/live/shorts path, or the bare id — and returns the id, or null if it
+// isn't recognizably a YouTube video. Done here rather than trusted from the
+// client because this id ends up in every other participant's iframe src.
+function parseYouTubeVideoId(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (YOUTUBE_VIDEO_ID_RE.test(trimmed)) return trimmed;
+  let url: URL;
+  try {
+    url = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`);
+  } catch {
+    return null;
+  }
+  const host = url.hostname.replace(/^www\./, "").toLowerCase();
+  let id: string | null = null;
+  if (host === "youtu.be") {
+    id = url.pathname.split("/")[1] ?? null;
+  } else if (host === "youtube.com" || host === "m.youtube.com" || host === "music.youtube.com" || host === "youtube-nocookie.com") {
+    if (url.pathname === "/watch") id = url.searchParams.get("v");
+    else {
+      const [, section, value] = url.pathname.split("/");
+      if (section === "embed" || section === "live" || section === "shorts" || section === "v") {
+        id = value ?? null;
+      }
+    }
+  }
+  return id && YOUTUBE_VIDEO_ID_RE.test(id) ? id : null;
+}
+
+function hasOwn(obj: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+// YouTube's own speed menu, which is what any honest client is reporting.
+// Anything else is clamped to the nearest end rather than rejected: this is
+// a viewing preference, and refusing the whole update over it would leave
+// the room's play/pause unapplied for something nobody would notice.
+const MIN_PLAYBACK_RATE = 0.25;
+const MAX_PLAYBACK_RATE = 2;
+function normalizePlaybackRate(raw: unknown): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return 1;
+  return Math.min(MAX_PLAYBACK_RATE, Math.max(MIN_PLAYBACK_RATE, Math.round(raw * 100) / 100));
+}
+
 const rooms = new Map<string, RoomInfo>();
 // Pending "really delete this now-empty room" timers, keyed by room — see
 // scheduleRoomDeletion.
@@ -1156,6 +1248,26 @@ function leaveRoom(info: ClientInfo) {
           flags: roomInfo.flags,
           code: roomInfo.code,
         });
+      }
+    }
+  }
+  // A video source belongs to whoever added it — they're the only one who
+  // can steer or remove it — so it goes when they do, rather than sitting
+  // there frozen with nobody able to touch it. Only once their *last*
+  // connection to this room is gone: a second tab, or a reconnect that
+  // briefly overlaps, must not take the video down.
+  if (roomInfo) {
+    const leaverId = stableUserId(info);
+    const stillHere = [...roomInfo.sockets]
+      .map((sock) => clients.get(sock))
+      .some((other) => other !== undefined && stableUserId(other) === leaverId);
+    if (!stillHere) {
+      const orphaned = roomInfo.videoSources.filter((v) => v.addedById === leaverId);
+      if (orphaned.length > 0) {
+        roomInfo.videoSources = roomInfo.videoSources.filter((v) => v.addedById !== leaverId);
+        for (const source of orphaned) {
+          broadcastToRoom(room, { type: "video-source-removed", id: source.id });
+        }
       }
     }
   }
@@ -2273,7 +2385,14 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
                 flags: [],
                 code: isPrivate ? generateRoomCode() : null,
               };
-              roomInfo = { sockets: new Set(), createdAt: Date.now(), messages, names: new Map(), ...record };
+              roomInfo = {
+                sockets: new Set(),
+                createdAt: Date.now(),
+                messages,
+                names: new Map(),
+                videoSources: [],
+                ...record,
+              };
               rooms.set(room, roomInfo);
               roomsCreatedTotal.inc({ visibility: isPrivateRoom(room) ? "private" : "public" });
               if (!existingRecord) void saveRoomRecord(room, record);
@@ -2291,7 +2410,19 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             .map((s) => clients.get(s))
             .filter((c): c is ClientInfo => c !== undefined)
             .map(peerSummary);
-          send(socket, { type: "room-state", room, selfId: info.id, peers, messages: roomInfo.messages });
+          send(socket, {
+            type: "room-state",
+            room,
+            selfId: info.id,
+            // The identity a video source is attributed to (see
+            // RoomVideoSource.addedById and peerSummary's `userId`) — the
+            // connection id above is per-socket and says nothing about who
+            // this is across a reconnect.
+            selfUserId: stableUserId(info),
+            peers,
+            messages: roomInfo.messages,
+            videoSources: roomInfo.videoSources,
+          });
           flushPendingSignals(info);
           broadcastToRoom(
             room,
@@ -2419,6 +2550,120 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           }
           info.mic = nextMic;
           broadcastToRoom(info.room, { type: "peer-mic", id: info.id, mic: info.mic });
+          break;
+        }
+        // Adding, removing and steering a room video source (see
+        // RoomVideoSource). All three are ordinary room broadcasts — the
+        // server owns the record so that a latecomer's "room-state" already
+        // describes what everyone else is watching, and so the playback
+        // position everyone extrapolates from comes off one clock.
+        case "video-source-add": {
+          if (!info.room || !info.name) return;
+          if (!(await consumeRateLimit(wsVideoSourceLimiter, info.rateLimitKey, "video-source"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (roomInfo.videoSources.length >= MAX_ROOM_VIDEO_SOURCES) {
+            send(socket, {
+              type: "error",
+              message: `Máximo de ${MAX_ROOM_VIDEO_SOURCES} fontes de vídeo por sala.`,
+            });
+            return;
+          }
+          const videoId = parseYouTubeVideoId(typeof msg.url === "string" ? msg.url : "");
+          if (!videoId) {
+            send(socket, { type: "error", message: "Link do YouTube inválido." });
+            return;
+          }
+          const source: RoomVideoSource = {
+            id: genId(),
+            kind: "youtube",
+            videoId,
+            addedById: stableUserId(info),
+            addedByName: info.name,
+            // Starts playing: someone who just added a video meant to watch
+            // it, and a source that arrives paused at 0 makes everyone wait
+            // for whoever added it to press play again.
+            playing: true,
+            positionSeconds: 0,
+            playbackRate: 1,
+            updatedAt: Date.now(),
+          };
+          roomInfo.videoSources.push(source);
+          broadcastToRoom(info.room, { type: "video-source-added", source });
+          break;
+        }
+        // Only whoever added it may take it off everyone's screen, same as
+        // only they may steer it. Everyone else can leave a video without
+        // ending it for the room — that's a purely local thing the client
+        // does on its own (see WatchRoom's hiddenVideoSourceIds), and never
+        // reaches this server. A source outliving its adder is handled by
+        // leaveRoom below, not by letting anyone remove anything.
+        case "video-source-remove": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsVideoSourceLimiter, info.rateLimitKey, "video-source"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          const id = typeof msg.id === "string" ? msg.id : "";
+          const target = roomInfo.videoSources.find((v) => v.id === id);
+          if (!target || target.addedById !== stableUserId(info)) return;
+          roomInfo.videoSources = roomInfo.videoSources.filter((v) => v.id !== id);
+          broadcastToRoom(info.room, { type: "video-source-removed", id });
+          break;
+        }
+        // Play/pause/seek, from whoever touched their player. Dropped
+        // silently when over budget, same as the other transient toggles:
+        // the next real state change re-syncs everyone anyway, and the
+        // periodic drift correction on the client never sends anything.
+        case "video-source-state": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsVideoSourceLimiter, info.rateLimitKey, "video-source"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          const id = typeof msg.id === "string" ? msg.id : "";
+          const source = roomInfo.videoSources.find((v) => v.id === id);
+          if (!source) return;
+          // Only whoever added it drives. Enforced here and not just in the
+          // UI: everyone else's player is following this record, so a client
+          // that decided to send anyway would be steering other people's
+          // screens. Silently ignored rather than answered with an error —
+          // the sender's own player is already blocked from reaching this,
+          // so anything arriving here is not an honest mistake.
+          if (source.addedById !== stableUserId(info)) return;
+          const rawPosition = typeof msg.positionSeconds === "number" ? msg.positionSeconds : NaN;
+          source.positionSeconds =
+            Number.isFinite(rawPosition) && rawPosition > 0 ? Math.min(rawPosition, 24 * 60 * 60) : 0;
+          source.playing = Boolean(msg.playing);
+          // Merged rather than overwritten: a client that doesn't know about
+          // speed (an older tab still open through a deploy) sends none, and
+          // its play/pause must not silently reset the room to 1x.
+          if (hasOwn(msg, "playbackRate")) {
+            source.playbackRate = normalizePlaybackRate(msg.playbackRate);
+          }
+          source.updatedAt = Date.now();
+          broadcastToRoom(info.room, {
+            type: "video-source-state",
+            id: source.id,
+            playing: source.playing,
+            positionSeconds: source.positionSeconds,
+            playbackRate: source.playbackRate,
+            updatedAt: source.updatedAt,
+          });
+          break;
+        }
+        // Clock synchronization, for the shared video sources. Their
+        // playback position is extrapolated from a server timestamp (see
+        // RoomVideoSource.updatedAt), so a client whose clock is a few
+        // seconds off watches a few seconds off — the one error the drift
+        // correction can never fix, because every client is confidently
+        // wrong by its own constant. This is the classic NTP exchange: the
+        // client stamps t0, this stamps its own now, and the client works
+        // out the offset from the round trip.
+        case "time-sync": {
+          send(socket, {
+            type: "time-sync",
+            t0: typeof msg.t0 === "number" ? msg.t0 : 0,
+            serverTime: Date.now(),
+          });
           break;
         }
         case "typing": {
