@@ -55,6 +55,7 @@ import {
   recordPersistedPartnerViewer,
   loadPersistedPartnerUniqueCounts,
   claimPersistedPartnerReward,
+  PARTNER_CLICK_REWARD_PLACEMENTS,
   deletePersistedPartnerRewardClaims,
   loadPersistedPartnerRewardClaimCounts,
   type Partner,
@@ -415,7 +416,10 @@ interface PartnerStatsEntry {
   views: number;
   // One per connection — see the "partner-session-view" case.
   sessionViews: number;
+  // CTA clicks, split by where the button was — see PartnerStats in
+  // partnerStore.ts for why these are two numbers and not one.
   clicks: number;
+  clicksByVideo: number;
   // Watch-to-earn funnel (see PartnerRewardModal.tsx) — see PartnerStats in
   // partnerStore.ts for what these do and don't dedupe.
   rewardVideoOpens: number;
@@ -431,6 +435,7 @@ function getPartnerStats(id: string): PartnerStatsEntry {
       views: 0,
       sessionViews: 0,
       clicks: 0,
+      clicksByVideo: 0,
       rewardVideoOpens: 0,
       rewardVideoCompletions: 0,
     };
@@ -445,6 +450,7 @@ function partnerStatsSummary(id: string) {
     views: entry?.views ?? 0,
     sessionViews: entry?.sessionViews ?? 0,
     clicks: entry?.clicks ?? 0,
+    clicksByVideo: entry?.clicksByVideo ?? 0,
     rewardVideoOpens: entry?.rewardVideoOpens ?? 0,
     rewardVideoCompletions: entry?.rewardVideoCompletions ?? 0,
   };
@@ -472,14 +478,20 @@ function partnerViewerKey(info: ClientInfo): string {
 // collect a reward a second time after a restart (see
 // claimPersistedPartnerReward).
 async function partnerStatsSummaries(ids: string[]) {
-  const [uniques, rewardClaims] = await Promise.all([
+  const [uniques, rewardClaims, clickRewardClaims] = await Promise.all([
     loadPersistedPartnerUniqueCounts(ids),
-    loadPersistedPartnerRewardClaimCounts(ids),
+    loadPersistedPartnerRewardClaimCounts(ids, "video"),
+    loadPersistedPartnerRewardClaimCounts(ids, "click"),
   ]);
   return Object.fromEntries(
     ids.map((id) => [
       id,
-      { ...partnerStatsSummary(id), uniqueViews: uniques[id] ?? 0, rewardClaims: rewardClaims[id] ?? 0 },
+      {
+        ...partnerStatsSummary(id),
+        uniqueViews: uniques[id] ?? 0,
+        rewardClaims: rewardClaims[id] ?? 0,
+        clickRewardClaims: clickRewardClaims[id] ?? 0,
+      },
     ])
   );
 }
@@ -528,6 +540,11 @@ function publicPartner(p: Partner) {
     expiresAt: p.expiresAt,
     rewardVideoUrl: p.rewardVideoUrl,
     rewardPoints: p.rewardPoints,
+    // `?? null` rather than a bare read: ads stored before click rewards
+    // existed have no such field at all, and the client distinguishes "no
+    // click reward" by null, not by undefined.
+    clickRewardPoints: p.clickRewardPoints ?? null,
+    clickRewardPlacement: p.clickRewardPlacement ?? null,
   };
 }
 
@@ -788,6 +805,7 @@ function parseAnnouncementBody(
 }
 
 type ParsedPartnerFields = Omit<Partner, "id" | "createdAt">;
+type PartnerClickRewardPlacement = NonNullable<Partner["clickRewardPlacement"]>;
 const PARTNER_WEIGHT_MIN = 1;
 const PARTNER_WEIGHT_MAX = 100;
 const PARTNER_COLOR_FIELDS = [
@@ -868,6 +886,41 @@ function parsePartnerBody(body: Record<string, unknown>): ParsedPartnerFields | 
     rewardPoints = rawRewardPoints;
   }
 
+  // Click-to-earn reward — points for clicking the ad's own CTA, independent
+  // of the video above (an ad can have either, both, or neither). Absent or
+  // empty means "no click reward", and the placement only exists alongside a
+  // points value, same pairing rule as the video reward.
+  const hasClickReward =
+    body.clickRewardPoints !== undefined &&
+    body.clickRewardPoints !== null &&
+    body.clickRewardPoints !== "";
+  let clickRewardPoints: number | null = null;
+  let clickRewardPlacement: PartnerClickRewardPlacement | null = null;
+  if (hasClickReward) {
+    const rawClickRewardPoints =
+      typeof body.clickRewardPoints === "number" && Number.isFinite(body.clickRewardPoints)
+        ? Math.round(body.clickRewardPoints)
+        : NaN;
+    if (
+      !Number.isFinite(rawClickRewardPoints) ||
+      rawClickRewardPoints < PARTNER_REWARD_POINTS_MIN ||
+      rawClickRewardPoints > PARTNER_REWARD_POINTS_MAX
+    ) {
+      return {
+        error: `Pontos por clique devem ser entre ${PARTNER_REWARD_POINTS_MIN} e ${PARTNER_REWARD_POINTS_MAX}.`,
+      };
+    }
+    const rawPlacement = typeof body.clickRewardPlacement === "string" ? body.clickRewardPlacement : "";
+    if (rawPlacement && !PARTNER_CLICK_REWARD_PLACEMENTS.includes(rawPlacement as PartnerClickRewardPlacement)) {
+      return { error: "Onde vale o ponto por clique é inválido." };
+    }
+    clickRewardPoints = rawClickRewardPoints;
+    // Defaults to the least surprising of the three: an admin who filled in
+    // an amount and nothing else means "pay for the click", not "pay for the
+    // click in one of the two places I didn't pick".
+    clickRewardPlacement = (rawPlacement as PartnerClickRewardPlacement) || "both";
+  }
+
   return {
     title,
     description,
@@ -879,6 +932,8 @@ function parsePartnerBody(body: Record<string, unknown>): ParsedPartnerFields | 
     expiresAt,
     rewardVideoUrl,
     rewardPoints,
+    clickRewardPoints,
+    clickRewardPlacement,
   };
 }
 
@@ -1218,6 +1273,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     entry.views = persisted.views;
     entry.sessionViews = persisted.sessionViews;
     entry.clicks = persisted.clicks;
+    entry.clicksByVideo = persisted.clicksByVideo;
     entry.rewardVideoOpens = persisted.rewardVideoOpens;
     entry.rewardVideoCompletions = persisted.rewardVideoCompletions;
   }
@@ -1584,11 +1640,42 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       if (!partner || !partner.rewardVideoUrl || !partner.rewardPoints) {
         return reply.code(404).send({ error: "Esse anúncio não tem recompensa em vídeo." });
       }
-      const claimed = await claimPersistedPartnerReward(id, payload.sub);
+      const claimed = await claimPersistedPartnerReward(id, payload.sub, "video");
       if (!claimed) {
         return reply.code(409).send({ error: "Você já resgatou essa recompensa." });
       }
       const points = await addAccountPoints(payload.sub, partner.rewardPoints);
+      return { points };
+    }
+  );
+
+  // The click-to-earn twin of the endpoint above: points for clicking the
+  // ad's CTA. Same one-per-account-per-ad gate, from its own claim set — the
+  // two rewards are independent, so collecting one must never consume the
+  // other. Deliberately does not care *where* the click happened
+  // (clickRewardPlacement is a UI decision about where the points are
+  // offered, and the client is not a source of truth about which button it
+  // rendered); what it enforces is that the ad has a click reward at all.
+  app.post(
+    "/partner/:id/claim-click-reward",
+    { config: { rateLimit: { max: 20, timeWindow: "1 minute" } } },
+    async (request, reply) => {
+      const payload = verifyToken(getBearerToken(request.headers.authorization));
+      if (!payload || payload.guest) {
+        return reply
+          .code(401)
+          .send({ error: "Crie uma conta ou entre em uma para receber pontos clicando." });
+      }
+      const { id } = request.params as { id: string };
+      const partner = partnerConfig.partners.find((p) => p.id === id);
+      if (!partner || !partner.clickRewardPoints) {
+        return reply.code(404).send({ error: "Esse anúncio não dá pontos por clique." });
+      }
+      const claimed = await claimPersistedPartnerReward(id, payload.sub, "click");
+      if (!claimed) {
+        return reply.code(409).send({ error: "Você já resgatou os pontos desse anúncio." });
+      }
+      const points = await addAccountPoints(payload.sub, partner.clickRewardPoints);
       return { points };
     }
   );
@@ -2502,12 +2589,23 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           void incrementPersistedPartnerStats(id, { sessionViews: 1 });
           break;
         }
+        // The same CTA exists in two places (the sidebar card and the
+        // reward-video popup), and each keeps its own counter. `source` says
+        // which — anything other than "video", including its absence from an
+        // older client, counts as the card, which is where the button lived
+        // before the popup had one.
         case "partner-click": {
           const id = typeof msg.id === "string" ? msg.id : "";
           if (!partnerConfig.partners.some((p) => p.id === id)) return;
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "partner-click"))) return;
-          getPartnerStats(id).clicks += 1;
-          void incrementPersistedPartnerStats(id, { clicks: 1 });
+          const fromVideo = msg.source === "video";
+          if (fromVideo) {
+            getPartnerStats(id).clicksByVideo += 1;
+            void incrementPersistedPartnerStats(id, { clicksByVideo: 1 });
+          } else {
+            getPartnerStats(id).clicks += 1;
+            void incrementPersistedPartnerStats(id, { clicks: 1 });
+          }
           break;
         }
         // Watch-to-earn funnel (see PartnerRewardModal.tsx) — sent when the
