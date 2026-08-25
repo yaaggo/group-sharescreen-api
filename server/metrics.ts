@@ -1,4 +1,5 @@
 import { Registry, collectDefaultMetrics, Gauge, Counter } from "prom-client";
+import { CLIENT_PLATFORMS, type ClientPlatform } from "./clientPlatform.js";
 
 export const register = new Registry();
 
@@ -29,6 +30,18 @@ export type IdentityStats = {
   guestsWithoutToken: number;
 };
 
+// How the same registered peers counted by IdentityStats split across the
+// kinds of client they're running — see clientPlatform.ts for what each
+// bucket means and how a connection is sorted into one. Every bucket is
+// always present, including the ones sitting at zero, so a Grafana panel
+// keeps a stable set of series instead of losing one the moment nobody is
+// on that platform right now.
+export type PlatformStats = Record<ClientPlatform, number>;
+
+export function emptyPlatformStats(): PlatformStats {
+  return Object.fromEntries(CLIENT_PLATFORMS.map((p) => [p, 0])) as PlatformStats;
+}
+
 // A count of currently-connected sockets sharing one GeoIP location (see
 // server/geoip.ts) — country plus lat/lon already rounded to ~11km. Entries
 // only ever exist for locations with at least one connection *right now*;
@@ -44,6 +57,7 @@ export type SignalingStats = {
   connectedSockets: number;
   registeredPeers: number;
   identities: IdentityStats;
+  platforms: PlatformStats;
   rooms: RoomStats[];
   locations: LocationStats[];
 };
@@ -52,6 +66,7 @@ const emptyStats: SignalingStats = {
   connectedSockets: 0,
   registeredPeers: 0,
   identities: { accounts: 0, guestsWithToken: 0, guestsWithoutToken: 0 },
+  platforms: emptyPlatformStats(),
   rooms: [],
   locations: [],
 };
@@ -100,6 +115,22 @@ new Gauge({
     this.set({ kind: "account" }, identities.accounts);
     this.set({ kind: "guest_with_token" }, identities.guestsWithToken);
     this.set({ kind: "guest_without_token" }, identities.guestsWithoutToken);
+  },
+});
+
+new Gauge({
+  name: "sharescreen_clients_by_platform",
+  help: "Registered peers by the kind of client they're using: an ordinary browser or an embedded WebView (an in-app browser such as Instagram's or Facebook's), on a phone/tablet or on a PC, plus GoLive's own desktop app. Same population as sharescreen_registered_peers, so the two always sum to the same number. \"unknown\" is a connection whose kind couldn't be established rather than a PC — see server/clientPlatform.ts.",
+  labelNames: ["platform"],
+  registers: [register],
+  collect() {
+    const { platforms } = getStats();
+    // No reset() here, unlike the room/location gauges below: the label set
+    // is this fixed list and every one of them is written on every scrape,
+    // so there is no such thing as a stale combination to drop.
+    for (const platform of CLIENT_PLATFORMS) {
+      this.set({ platform }, platforms[platform] ?? 0);
+    }
   },
 });
 

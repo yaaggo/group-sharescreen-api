@@ -13,11 +13,17 @@ import {
   chatMessagesBlockedTotal,
   autoBansTotal,
   turnstileVerificationsTotal,
+  emptyPlatformStats,
   type LocationStats,
 } from "./metrics.js";
 import { recordViolation } from "./rateLimiter.js";
 import { verifyTurnstileToken, TURNSTILE_ENABLED } from "./turnstile.js";
 import { lookupConnectionLocation, type ConnectionLocation } from "./geoip.js";
+import {
+  classifyClientPlatform,
+  parseDeviceReport,
+  type ClientPlatform,
+} from "./clientPlatform.js";
 import { signToken, verifyToken, requireAdmin, getBearerToken } from "./auth.js";
 import {
   createAccount,
@@ -314,6 +320,19 @@ interface ClientInfo {
   // on every single scrape (it's deterministic for a given `ip`, so once is
   // enough for this connection's whole lifetime).
   geoLocation: ConnectionLocation | null;
+  // The kind of client on the other end — which of /metrics's platform
+  // buckets this connection counts towards (see clientPlatform.ts, and
+  // metrics.ts's clientsByPlatformGauge). Derived from the User-Agent at
+  // connect time so a connection that never registers is still classified,
+  // then re-derived once on "register" if the client reported its own
+  // device, which is the better answer for everything except the
+  // browser-vs-WebView half. Cached here rather than recomputed on every
+  // Prometheus scrape for the same reason geoLocation above is.
+  platform: ClientPlatform;
+  // The upgrade request's User-Agent, kept only so `platform` can be
+  // re-derived when the register-time device report arrives — by then the
+  // request object is long gone.
+  userAgent: string;
   // Set for a moderator connection opened via "admin-join" (see
   // registerAdminRoutes below). Moderator sockets ride the exact same room
   // machinery as a real participant — they're added to the room's socket
@@ -889,10 +908,17 @@ const pendingSignals = new Map<string, PendingSignal[]>();
 registerStatsProvider(() => {
   const registeredPeers = [...clients.values()].filter((c) => c.name !== null && !c.isModerator);
   const identities = { accounts: 0, guestsWithToken: 0, guestsWithoutToken: 0 };
+  // Deliberately the same registeredPeers population as identities above,
+  // and not clients.size: sharescreen_clients_by_platform is a count of
+  // *people*, so it has to add up to sharescreen_registered_peers rather
+  // than to a socket count that also carries moderators and connections
+  // still sitting on the name screen.
+  const platforms = emptyPlatformStats();
   for (const c of registeredPeers) {
     if (c.accountId) identities.accounts += 1;
     else if (c.guestVerified) identities.guestsWithToken += 1;
     else identities.guestsWithoutToken += 1;
+    platforms[c.platform] += 1;
   }
   // Keyed by "country|lat|lon" purely to dedupe while counting — the actual
   // label values are read back out of each entry below, not parsed from the
@@ -912,6 +938,7 @@ registerStatsProvider(() => {
     connectedSockets: clients.size,
     registeredPeers: registeredPeers.length,
     identities,
+    platforms,
     rooms: [...rooms.entries()].map(([handle, info]) => ({
       handle,
       peopleCount: realPeopleCount(info),
@@ -2397,6 +2424,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     },
     (socket: WebSocket, request: FastifyRequest) => {
     const ip = request.ip;
+    const userAgent = typeof request.headers["user-agent"] === "string" ? request.headers["user-agent"] : "";
     if (isIpBanned(ip)) {
       bannedIpConnectionsRejectedTotal.inc();
       socket.close(BANNED_CLOSE_CODE, "ip-banned");
@@ -2413,6 +2441,8 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       socket,
       ip,
       geoLocation: lookupConnectionLocation(ip),
+      userAgent,
+      platform: classifyClientPlatform(userAgent, null),
       rateLimitKey: genId(),
     };
     clients.set(socket, info);
@@ -2474,6 +2504,17 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           const rawFingerprint = typeof msg.fingerprint === "string" ? msg.fingerprint : "";
           if (rawFingerprint && isValidBanValue("fingerprint", rawFingerprint)) {
             info.fingerprint = rawFingerprint;
+          }
+          // What kind of machine/shell this is, as the client itself sees it
+          // (see the website's currentAnnouncementDevice) — the half of
+          // ClientInfo.platform the User-Agent guesses badly. Absent from an
+          // older client that predates the field, and from one whose
+          // navigator couldn't be read; the connect-time classification is
+          // left standing in that case rather than overwritten with a worse
+          // one.
+          const reportedDevice = parseDeviceReport(msg.device);
+          if (reportedDevice) {
+            info.platform = classifyClientPlatform(info.userAgent, reportedDevice);
           }
           // The two bans that can't be enforced at connection time the way an
           // IP ban is: neither the account nor the fingerprint is known until
