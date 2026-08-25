@@ -1185,9 +1185,9 @@ function broadcastToRoom(room: string, msg: unknown, exclude?: WebSocket) {
   }
 }
 
-// Every open socket on the signaling server, regardless of room — used only
-// for the site-wide announcement banner, which is deliberately not
-// room-scoped.
+// Every open socket on the signaling server, regardless of room — for the
+// handful of pushes that are site-wide rather than room-scoped: the
+// announcement banner, and the desktop update nudge below.
 function broadcastToAll(msg: unknown) {
   for (const s of clients.keys()) send(s, msg);
 }
@@ -1913,6 +1913,36 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     await deletePersistedAnnouncement();
     broadcastToAll({ type: "announcement", announcement: null, live: true });
     return reply.code(204).send();
+  });
+
+  // "A new desktop release is up — everyone go look now."
+  //
+  // Deliberately carries no version and stores no state. The desktop shell
+  // already polls GitHub every 6 hours and downloads whatever it finds (see
+  // electron/updater.ts); all this does is collapse that wait to seconds
+  // right after a release is published, by telling every connected app to
+  // run its check immediately instead of on its own schedule.
+  //
+  // What it explicitly does *not* do is force the green install button to
+  // appear. The button is shown by a client that has actually finished
+  // downloading an update, and nothing else — a nudge that could conjure it
+  // on a machine already running the newest version would be offering an
+  // install that cannot happen. Someone up to date simply ignores this
+  // message, which is the correct outcome and needs no code.
+  //
+  // Nothing is persisted for the same reason: a client that connects a
+  // minute later runs its own check 45s into launch anyway, so a stored
+  // "pending nudge" would only ever duplicate what already happens.
+  app.post("/admin/desktop-update", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } }, async (request, reply) => {
+    if (!requireAdmin(request)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    broadcastToAll({ type: "desktop-update-check" });
+    // The socket count, not a desktop-app count: the server cannot tell the
+    // two apart (the shell is the same website over the same websocket), so
+    // reporting it as "avisados" would overstate what happened. The panel
+    // words it as connections for that reason.
+    return { notified: clients.size };
   });
 
   // Supporters list shown on hover over "Apoiar projeto" (see
