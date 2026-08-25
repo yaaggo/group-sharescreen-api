@@ -46,6 +46,7 @@ import {
   type AnnouncementColor,
   type AnnouncementVisibility,
   type AnnouncementSound,
+  type AnnouncementDevice,
 } from "./announcementStore.js";
 import {
   loadPersistedPartnerConfig,
@@ -484,6 +485,39 @@ const ANNOUNCEMENT_ACTIONS = new Set<AnnouncementButtonAction>([
 const ANNOUNCEMENT_COLORS = new Set<AnnouncementColor>(["green", "red", "blue"]);
 const ANNOUNCEMENT_VISIBILITIES = new Set<AnnouncementVisibility>(["online-only", "all"]);
 const ANNOUNCEMENT_SOUNDS = new Set<AnnouncementSound>(["always", "live-only", "off"]);
+const ANNOUNCEMENT_DEVICES: AnnouncementDevice[] = [
+  "desktop-browser",
+  "desktop-app",
+  "mobile-browser",
+  "mobile-app",
+];
+const ANNOUNCEMENT_DEVICE_SET = new Set<AnnouncementDevice>(ANNOUNCEMENT_DEVICES);
+
+// Every device when the field is missing entirely — an admin client that
+// predates it must keep sending announcements everyone sees, same reasoning
+// as `hasButton`'s default below. A *present* list is taken literally, and
+// an empty one is rejected by the caller rather than quietly widened: that
+// is an admin who unticked all four, and silently showing the banner to
+// everybody would be the opposite of what they asked for.
+function parseAnnouncementDevices(
+  raw: unknown
+): AnnouncementDevice[] | { error: string } {
+  if (raw === undefined || raw === null) return [...ANNOUNCEMENT_DEVICES];
+  if (!Array.isArray(raw)) return { error: "Dispositivos inválidos." };
+  const devices: AnnouncementDevice[] = [];
+  for (const value of raw) {
+    if (typeof value !== "string" || !ANNOUNCEMENT_DEVICE_SET.has(value as AnnouncementDevice)) {
+      return { error: "Dispositivos inválidos." };
+    }
+    // Deduped so a client that sends the same value twice can't grow the
+    // stored list without bound across repeated edits.
+    if (!devices.includes(value as AnnouncementDevice)) devices.push(value as AnnouncementDevice);
+  }
+  if (devices.length === 0) {
+    return { error: "Selecione ao menos um dispositivo." };
+  }
+  return devices;
+}
 // Custom admin-chosen announcement id (see POST /admin/announcement) — kept
 // distinct from HANDLE_RE/CLIENT_ID_RE since it's a different namespace, but
 // the same conservative charset.
@@ -986,6 +1020,10 @@ function parseAnnouncementBody(
   if (!ANNOUNCEMENT_SOUNDS.has(sound as AnnouncementSound)) {
     return { error: "Opção de som inválida." };
   }
+  const devices = parseAnnouncementDevices(body.devices);
+  if ("error" in devices) {
+    return { error: devices.error };
+  }
   const dismissible = Boolean(body.dismissible);
   const persistent = Boolean(body.persistent);
   // Defaults to true (button shown) when omitted, so an old admin client
@@ -1004,6 +1042,7 @@ function parseAnnouncementBody(
       visibility: visibility as AnnouncementVisibility,
       sound: sound as AnnouncementSound,
       persistent,
+      devices,
     };
   }
 
@@ -1035,6 +1074,7 @@ function parseAnnouncementBody(
     visibility: visibility as AnnouncementVisibility,
     sound: sound as AnnouncementSound,
     persistent,
+    devices,
   };
 }
 

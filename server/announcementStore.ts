@@ -10,6 +10,17 @@ export type AnnouncementColor = "green" | "red" | "blue";
 export type AnnouncementVisibility = "online-only" | "all";
 // Client-side sound policy — see components/AnnouncementBanner.tsx.
 export type AnnouncementSound = "always" | "live-only" | "off";
+// Which kinds of client the banner is for. Enforced entirely client-side
+// (see components/AnnouncementBanner.tsx) — the server has no reliable way
+// to tell the Electron shell from a browser tab, since both are the same
+// site on the same socket, so it stores and relays this without acting on
+// it. "mobile-app" has no client reporting it yet; see the website's
+// lib/announcement.ts for why it exists anyway.
+export type AnnouncementDevice =
+  | "desktop-browser"
+  | "desktop-app"
+  | "mobile-browser"
+  | "mobile-app";
 
 export interface Announcement {
   id: string;
@@ -30,6 +41,11 @@ export interface Announcement {
   // its localStorage fallback) for what this actually changes client-side.
   // The server itself treats it as an opaque passthrough field.
   persistent: boolean;
+  // Optional because announcements written before this field existed are
+  // still in Redis / on disk without it. Absent means every device — see
+  // parseAnnouncementBody in signaling.ts, and announcementTargetsDevice on
+  // the website side, which both read it that way.
+  devices?: AnnouncementDevice[];
 }
 
 // Redis is opt-in: only used when REDIS_URL is set. With no Redis around,
