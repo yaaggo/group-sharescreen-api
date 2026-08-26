@@ -49,6 +49,8 @@ import {
   deleteRoomRecord,
   normalizeRoomPermissions,
   normalizeRoomLocation,
+  normalizeRoomDescription,
+  normalizeRoomCategory,
   ROOM_PERMISSION_KEYS,
   DEFAULT_ROOM_PERMISSIONS,
   type RoomRecord,
@@ -548,6 +550,8 @@ function roomSettingsPayload(roomInfo: RoomInfo) {
     admins: roomInfo.admins,
     permissions: roomInfo.permissions,
     location: roomInfo.location,
+    description: roomInfo.description,
+    category: roomInfo.category,
   };
 }
 
@@ -564,6 +568,8 @@ function persistRoomRecord(room: string, roomInfo: RoomInfo): void {
     admins: roomInfo.admins,
     permissions: roomInfo.permissions,
     location: roomInfo.location,
+    description: roomInfo.description,
+    category: roomInfo.category,
   });
 }
 
@@ -1788,6 +1794,9 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
         // simply doesn't draw a marker for those (see the client's /mapa),
         // and the plain list ignores the field entirely.
         location: info.location,
+        // Shown by both the list and the map; "" / null when unset.
+        description: info.description,
+        category: info.category,
       }))
       .sort((a, b) => b.peopleCount - a.peopleCount || a.createdAt - b.createdAt);
     return { rooms: publicRooms };
@@ -3027,9 +3036,11 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
                 // DEFAULT_ROOM_PERMISSIONS.
                 admins: [],
                 permissions: { ...DEFAULT_ROOM_PERMISSIONS },
-                // Unplaced until someone puts it somewhere — see
-                // "room-location-set" and the public room map.
+                // Unplaced and undescribed until someone says otherwise —
+                // see "room-location-set" and "room-info-set".
                 location: null,
+                description: "",
+                category: null,
               };
               roomInfo = {
                 sockets: new Set(),
@@ -3381,6 +3392,32 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           // where the pin already was.
           if (next?.lat === current?.lat && next?.lng === current?.lng) return;
           roomInfo.location = next;
+          persistRoomRecord(info.room, roomInfo);
+          broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+          break;
+        }
+        // The room's blurb and category (see roomStore.ts). Owner and admins,
+        // same as everything else about how the room presents itself. Each
+        // field is only touched when the message actually carries it, so the
+        // description input and the category picker can save independently
+        // without either clearing the other.
+        case "room-info-set": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (!isRoomManager(roomInfo, info)) return;
+          const nextDescription = hasOwn(msg, "description")
+            ? normalizeRoomDescription(msg.description)
+            : roomInfo.description;
+          const nextCategory = hasOwn(msg, "category")
+            ? normalizeRoomCategory(msg.category)
+            : roomInfo.category;
+          // The description input saves as you stop typing, so the same value
+          // can arrive more than once — nothing to broadcast for a no-op.
+          if (nextDescription === roomInfo.description && nextCategory === roomInfo.category) return;
+          roomInfo.description = nextDescription;
+          roomInfo.category = nextCategory;
           persistRoomRecord(info.room, roomInfo);
           broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
           break;

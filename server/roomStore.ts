@@ -104,6 +104,48 @@ export function normalizeRoomLocation(raw: unknown): RoomLocation | null {
   return { lat, lng: wrapped };
 }
 
+// The room's own blurb and category, shown wherever a room is listed — the
+// public list and the map (see the client's /rooms and /mapa). Both are set
+// by the owner/admins and are purely descriptive: nothing keys behavior off
+// either one.
+export const MAX_ROOM_DESCRIPTION_LENGTH = 120;
+
+// Fixed set, not free text: these are what the room list and the map filter
+// and colour by, and a free-text category would be a thousand spellings of
+// "gameplay". The client has its own copy with the human labels (see
+// lib/roomCategories.ts) — the ids here are the contract between them.
+export const ROOM_CATEGORIES = [
+  "gameplay",
+  "conversa",
+  "musica",
+  "filmes",
+  "estudos",
+  "trabalho",
+  "esportes",
+  "programacao",
+  "arte",
+  "outros",
+] as const;
+
+export type RoomCategory = (typeof ROOM_CATEGORIES)[number];
+
+const ROOM_CATEGORY_SET = new Set<string>(ROOM_CATEGORIES);
+
+// Anything not in the list — including a category this server has never heard
+// of, from a newer client — reads as "no category" rather than being stored
+// and then rendered as a blank chip everywhere.
+export function normalizeRoomCategory(raw: unknown): RoomCategory | null {
+  return typeof raw === "string" && ROOM_CATEGORY_SET.has(raw) ? (raw as RoomCategory) : null;
+}
+
+// Trimmed and hard-capped here rather than trusted from the client: the input
+// enforces the same limit, but the limit is what the list layout is built
+// around, so it has to hold for anything that reaches storage.
+export function normalizeRoomDescription(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  return raw.replace(/\s+/g, " ").trim().slice(0, MAX_ROOM_DESCRIPTION_LENGTH);
+}
+
 export interface RoomRecord {
   ownerId: string;
   // Derived from the `priv-` handle prefix at creation time (see
@@ -129,6 +171,9 @@ export interface RoomRecord {
   // without a backfill migration.
   admins: RoomAdmin[];
   permissions: RoomPermissions;
+  // "" and null when nobody has set them — see the two normalizers above.
+  description: string;
+  category: RoomCategory | null;
   // See RoomLocation. Read by the public room map, and settable only by the
   // room's owner and admins (see signaling.ts's "room-location-set").
   location: RoomLocation | null;
@@ -148,6 +193,8 @@ function normalizeRoomRecord(raw: unknown): RoomRecord | null {
     admins: normalizeRoomAdmins(record.admins),
     permissions: normalizeRoomPermissions(record.permissions),
     location: normalizeRoomLocation(record.location),
+    description: normalizeRoomDescription(record.description),
+    category: normalizeRoomCategory(record.category),
   };
 }
 
