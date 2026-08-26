@@ -48,6 +48,7 @@ import {
   saveRoomRecord,
   deleteRoomRecord,
   normalizeRoomPermissions,
+  normalizeRoomLocation,
   ROOM_PERMISSION_KEYS,
   DEFAULT_ROOM_PERMISSIONS,
   type RoomRecord,
@@ -546,6 +547,7 @@ function roomSettingsPayload(roomInfo: RoomInfo) {
     ownerId: roomInfo.ownerId,
     admins: roomInfo.admins,
     permissions: roomInfo.permissions,
+    location: roomInfo.location,
   };
 }
 
@@ -561,6 +563,7 @@ function persistRoomRecord(room: string, roomInfo: RoomInfo): void {
     code: roomInfo.code,
     admins: roomInfo.admins,
     permissions: roomInfo.permissions,
+    location: roomInfo.location,
   });
 }
 
@@ -1781,6 +1784,10 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
         handle,
         peopleCount: realPeopleCount(info),
         createdAt: info.createdAt,
+        // Null for a room nobody has placed on the map yet — the map page
+        // simply doesn't draw a marker for those (see the client's /mapa),
+        // and the plain list ignores the field entirely.
+        location: info.location,
       }))
       .sort((a, b) => b.peopleCount - a.peopleCount || a.createdAt - b.createdAt);
     return { rooms: publicRooms };
@@ -3020,6 +3027,9 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
                 // DEFAULT_ROOM_PERMISSIONS.
                 admins: [],
                 permissions: { ...DEFAULT_ROOM_PERMISSIONS },
+                // Unplaced until someone puts it somewhere — see
+                // "room-location-set" and the public room map.
+                location: null,
               };
               roomInfo = {
                 sockets: new Set(),
@@ -3338,6 +3348,39 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           const userId = typeof msg.userId === "string" ? msg.userId : "";
           if (!userId || !roomInfo.admins.some((a) => a.id === userId)) return;
           roomInfo.admins = roomInfo.admins.filter((a) => a.id !== userId);
+          persistRoomRecord(info.room, roomInfo);
+          broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+          break;
+        }
+        // Where the room sits on the public room map (see RoomLocation).
+        // Owner and admins, same as the permission switches — placing the
+        // room is running it, not participating in it. A null/absent
+        // `location` clears the pin, which is how "Remover do mapa" works.
+        case "room-location-set": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (!isRoomManager(roomInfo, info)) return;
+          // The map only ever lists public rooms, so a pin on a private one
+          // would be state nobody can see — and letting it be set would put a
+          // private room one visibility change away from being on a public
+          // map. Clearing is still allowed: a room that was pinned while
+          // public must be able to come off the map.
+          if (isPrivateRoom(info.room) && msg.location) {
+            send(socket, {
+              type: "error",
+              message: "Apenas salas públicas podem definir uma localização.",
+            });
+            return;
+          }
+          const next = normalizeRoomLocation(msg.location);
+          const current = roomInfo.location;
+          // Nothing to broadcast when the pin didn't actually move — the map
+          // view sends on every "Salvar", including one that re-confirms
+          // where the pin already was.
+          if (next?.lat === current?.lat && next?.lng === current?.lng) return;
+          roomInfo.location = next;
           persistRoomRecord(info.room, roomInfo);
           broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
           break;

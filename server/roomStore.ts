@@ -79,6 +79,31 @@ export function normalizeRoomAdmins(raw: unknown): RoomAdmin[] {
   return out;
 }
 
+// Where on Earth the room's owner/admins put it, for the public room map
+// (see the client's /mapa). Null for a room nobody has placed — which is
+// every room until someone does, and the only state a private room is ever
+// in as far as the map is concerned, since the map only ever lists public
+// rooms.
+export interface RoomLocation {
+  lat: number;
+  lng: number;
+}
+
+// Rejects anything that isn't a real point on the globe — a NaN, an Infinity,
+// a latitude past the poles — rather than letting it through to a map that
+// would then place a marker nowhere. Longitude is wrapped rather than
+// rejected: a map panned east past the date line legitimately reports 190°,
+// which is 170° W, not an error.
+export function normalizeRoomLocation(raw: unknown): RoomLocation | null {
+  if (!raw || typeof raw !== "object") return null;
+  const { lat, lng } = raw as { lat?: unknown; lng?: unknown };
+  if (typeof lat !== "number" || typeof lng !== "number") return null;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (lat < -90 || lat > 90) return null;
+  const wrapped = ((((lng + 180) % 360) + 360) % 360) - 180;
+  return { lat, lng: wrapped };
+}
+
 export interface RoomRecord {
   ownerId: string;
   // Derived from the `priv-` handle prefix at creation time (see
@@ -104,6 +129,9 @@ export interface RoomRecord {
   // without a backfill migration.
   admins: RoomAdmin[];
   permissions: RoomPermissions;
+  // See RoomLocation. Read by the public room map, and settable only by the
+  // room's owner and admins (see signaling.ts's "room-location-set").
+  location: RoomLocation | null;
 }
 
 // Fills in whatever a persisted record predates, so every caller can treat
@@ -119,6 +147,7 @@ function normalizeRoomRecord(raw: unknown): RoomRecord | null {
     code: typeof record.code === "string" ? record.code : null,
     admins: normalizeRoomAdmins(record.admins),
     permissions: normalizeRoomPermissions(record.permissions),
+    location: normalizeRoomLocation(record.location),
   };
 }
 
