@@ -3,13 +3,82 @@ import path from "node:path";
 import { createClient } from "redis";
 
 // Everything persisted about a room besides its chat history (that's
-// chatStore.ts). `ownerId` is the only field anything currently *acts* on
-// (see signaling.ts's "join" handler and leaveRoom's ownership handoff) —
-// private/flags/code are stored and carried forward across restarts
-// starting now, but nothing reads them to actually change behavior yet.
-// They exist so that whenever that changes, every room created from here
-// on already has real values sitting in Redis instead of needing a
-// backfill migration.
+// chatStore.ts). `ownerId`, `admins` and `permissions` are the fields
+// anything currently *acts* on (see signaling.ts's "join" handler,
+// leaveRoom's ownership handoff, and canUseRoomPermission) — private/flags/
+// code are stored and carried forward across restarts, but nothing reads
+// them to actually change behavior yet. They exist so that whenever that
+// changes, every room created from here on already has real values sitting
+// in Redis instead of needing a backfill migration.
+// Someone the room's owner promoted to help run it (see signaling.ts's
+// "room-admin-add"). An admin can do everything the owner can except hand
+// out or take away admin — that stays the owner's alone. `name` is a copy of
+// their display name at promotion time, kept purely so the "Gerenciar
+// administradores" list can still name an admin who isn't currently in the
+// room; whenever they *are* in it, the live peer list's name wins.
+export interface RoomAdmin {
+  id: string;
+  name: string;
+}
+
+// Per-room switches for what an ordinary member is allowed to do. All true
+// by default — a room only ever gets more restrictive by someone deliberately
+// turning one off, never by upgrading past this. A false one doesn't disable
+// the action outright: the owner and the room's admins are never subject to
+// these (see canUseRoomPermission in signaling.ts), which is the whole point
+// of turning one off — "only I get to do this", not "nobody does".
+export interface RoomPermissions {
+  mic: boolean;
+  screen: boolean;
+  camera: boolean;
+  videoSource: boolean;
+  chat: boolean;
+  gif: boolean;
+}
+
+export const DEFAULT_ROOM_PERMISSIONS: RoomPermissions = {
+  mic: true,
+  screen: true,
+  camera: true,
+  videoSource: true,
+  chat: true,
+  gif: true,
+};
+
+export const ROOM_PERMISSION_KEYS = Object.keys(
+  DEFAULT_ROOM_PERMISSIONS
+) as (keyof RoomPermissions)[];
+
+// Anything missing or not a boolean falls back to the permissive default —
+// which covers both a record written before these existed (every room in
+// Redis right now) and a client sending a partial update.
+export function normalizeRoomPermissions(raw: unknown): RoomPermissions {
+  const source = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const out = { ...DEFAULT_ROOM_PERMISSIONS };
+  for (const key of ROOM_PERMISSION_KEYS) {
+    if (typeof source[key] === "boolean") out[key] = source[key] as boolean;
+  }
+  return out;
+}
+
+// Same defensive read for the admin list, plus de-duplication by id: the
+// promote handler already refuses to add someone twice, but a hand-edited or
+// half-migrated record shouldn't be able to put the same person in the list
+// (and therefore in the management UI) more than once.
+export function normalizeRoomAdmins(raw: unknown): RoomAdmin[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const out: RoomAdmin[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const { id, name } = entry as { id?: unknown; name?: unknown };
+    if (typeof id !== "string" || !id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, name: typeof name === "string" ? name : "" });
+  }
+  return out;
+}
+
 export interface RoomRecord {
   ownerId: string;
   // Derived from the `priv-` handle prefix at creation time (see
@@ -26,6 +95,31 @@ export interface RoomRecord {
   // it's ready the moment something actually gates entry on it, but no
   // "join" path checks it yet.
   code: string | null;
+  // Everyone the owner promoted to co-run the room, and what an ordinary
+  // member is allowed to do in it. Unlike the three fields above, these two
+  // *are* acted on — see signaling.ts's canUseRoomPermission and the
+  // "room-admin-add"/"room-permissions-set" handlers — so they're read back
+  // through normalizeRoomAdmins/normalizeRoomPermissions on load, which is
+  // what gives a room persisted before they existed sane starting values
+  // without a backfill migration.
+  admins: RoomAdmin[];
+  permissions: RoomPermissions;
+}
+
+// Fills in whatever a persisted record predates, so every caller can treat
+// what comes back as a complete RoomRecord.
+function normalizeRoomRecord(raw: unknown): RoomRecord | null {
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw as Partial<RoomRecord>;
+  if (typeof record.ownerId !== "string") return null;
+  return {
+    ownerId: record.ownerId,
+    private: Boolean(record.private),
+    flags: Array.isArray(record.flags) ? record.flags.filter((f) => typeof f === "string") : [],
+    code: typeof record.code === "string" ? record.code : null,
+    admins: normalizeRoomAdmins(record.admins),
+    permissions: normalizeRoomPermissions(record.permissions),
+  };
 }
 
 // Redis is opt-in: only used when REDIS_URL is set. With no Redis around,
@@ -51,8 +145,7 @@ function roomFilePath(room: string): string {
 function loadFromDisk(room: string): RoomRecord | null {
   try {
     const raw = fs.readFileSync(roomFilePath(room), "utf8");
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? (parsed as RoomRecord) : null;
+    return normalizeRoomRecord(JSON.parse(raw));
   } catch {
     return null;
   }
@@ -116,7 +209,7 @@ export async function loadRoomRecord(room: string): Promise<RoomRecord | null> {
   try {
     const client = await getRedis();
     const raw: string | null = await client.get(redisKey(room));
-    return raw ? (JSON.parse(raw) as RoomRecord) : null;
+    return raw ? normalizeRoomRecord(JSON.parse(raw)) : null;
   } catch (err) {
     console.error("[roomStore] Erro ao carregar sala no Redis:", (err as Error).message);
     return null;

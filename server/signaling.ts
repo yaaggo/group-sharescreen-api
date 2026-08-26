@@ -43,7 +43,17 @@ import {
   deletePersistedChat,
   type ChatMessage,
 } from "./chatStore.js";
-import { loadRoomRecord, saveRoomRecord, deleteRoomRecord, type RoomRecord } from "./roomStore.js";
+import {
+  loadRoomRecord,
+  saveRoomRecord,
+  deleteRoomRecord,
+  normalizeRoomPermissions,
+  ROOM_PERMISSION_KEYS,
+  DEFAULT_ROOM_PERMISSIONS,
+  type RoomRecord,
+  type RoomAdmin,
+  type RoomPermissions,
+} from "./roomStore.js";
 import {
   loadPersistedAnnouncement,
   savePersistedAnnouncement,
@@ -494,6 +504,79 @@ function isSameOwner(existing: ClientInfo, challenger: ClientInfo): boolean {
   return Boolean(challenger.guestVerified) && existing.guestId === challenger.guestId;
 }
 
+// The room's owner, or anyone they promoted (see RoomAdmin). This is the one
+// predicate every room-permission check below runs through: a manager is
+// never subject to the room's own permission switches, because turning one
+// off is exactly how a manager says "from here on, only us".
+function isRoomManager(roomInfo: RoomInfo, info: ClientInfo): boolean {
+  // A moderator's admin-join ghost never sends any of the actions these
+  // gate, but it also must never be blocked by a room's local rules — its
+  // authority comes from the ADMIN flag on its token, not from this room.
+  if (info.isModerator) return true;
+  const userId = stableUserId(info);
+  return roomInfo.ownerId === userId || roomInfo.admins.some((a) => a.id === userId);
+}
+
+// Only the *owner* hands out and takes away admin — an admin managing other
+// admins could promote a friend, demote the rest, and leave the owner
+// outnumbered in their own room. Everything else a manager can do (the
+// permission switches) is shared.
+function isRoomOwner(roomInfo: RoomInfo, info: ClientInfo): boolean {
+  return roomInfo.ownerId === stableUserId(info);
+}
+
+// Whether this connection may perform `key` in this room right now. Note the
+// order: the switch being on lets *anyone* through, and being off still lets
+// the room's managers through — so a false permission narrows an action down
+// to the owner and admins rather than removing it from the room.
+function canUseRoomPermission(
+  roomInfo: RoomInfo,
+  info: ClientInfo,
+  key: keyof RoomPermissions
+): boolean {
+  return roomInfo.permissions[key] !== false || isRoomManager(roomInfo, info);
+}
+
+// What every client is told about who runs the room and what it currently
+// allows — sent inside "room-state" on join and broadcast on its own
+// ("room-settings") on every change, so a room's rules never depend on
+// having been present when they were set.
+function roomSettingsPayload(roomInfo: RoomInfo) {
+  return {
+    ownerId: roomInfo.ownerId,
+    admins: roomInfo.admins,
+    permissions: roomInfo.permissions,
+  };
+}
+
+// Persists the parts of a RoomInfo that outlive the process (see
+// roomStore.ts's RoomRecord) — called from every place that changes one of
+// them, so no caller has to remember which of RoomInfo's fields are the
+// persisted ones.
+function persistRoomRecord(room: string, roomInfo: RoomInfo): void {
+  void saveRoomRecord(room, {
+    ownerId: roomInfo.ownerId,
+    private: roomInfo.private,
+    flags: roomInfo.flags,
+    code: roomInfo.code,
+    admins: roomInfo.admins,
+    permissions: roomInfo.permissions,
+  });
+}
+
+// Refused actions answer with this rather than a plain "error" so the client
+// can react to the specific thing it was refused — turning the mic back off,
+// dropping a share it already started locally, and saying which rule stopped
+// it. See the client's "room-permission-denied" handling.
+const ROOM_PERMISSION_DENIED_MESSAGE: Record<keyof RoomPermissions, string> = {
+  mic: "A administração desativou o microfone para os participantes.",
+  screen: "A administração desativou o compartilhamento de tela para os participantes.",
+  camera: "A administração desativou a câmera para os participantes.",
+  videoSource: "A administração desativou adicionar fontes de vídeo para os participantes.",
+  chat: "A administração desativou o chat para os participantes.",
+  gif: "A administração desativou o envio de GIFs para os participantes.",
+};
+
 // Announcement/AnnouncementButtonAction/AnnouncementColor/
 // AnnouncementVisibility/AnnouncementSound come from announcementStore.js
 // (imported above) — that's also where the persisted copy lives, so both
@@ -574,6 +657,10 @@ const clientsById = new Map<string, ClientInfo>();
 // enough that nobody can bury a room's own transmissions under a wall of
 // embedded players.
 const MAX_ROOM_VIDEO_SOURCES = 4;
+// The owner may promote as many members as they like — this is only a sanity
+// bound on the persisted record (and on what the management UI has to list),
+// not a product limit anyone realistically runs into.
+const MAX_ROOM_ADMINS = 50;
 const YOUTUBE_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 
 // Accepts anything someone is likely to paste — a watch URL, youtu.be, an
@@ -1452,16 +1539,26 @@ function leaveRoom(info: ClientInfo) {
       // write for an event this rare (an owner actually leaving a room that
       // still has people in it) is nothing next to what it'd cost to do
       // this on every join instead.
-      const nextSocket = roomInfo.sockets.values().next().value;
-      const nextOwner = nextSocket ? clients.get(nextSocket) : undefined;
+      //
+      // An admin the departing owner promoted comes first, ahead of plain
+      // seniority: promoting someone is the owner already having said who
+      // they trust to run the place, so handing the room to a stranger who
+      // merely arrived earlier would throw that away. Falls back to the
+      // longest-present member when no admin is left.
+      const remaining = [...roomInfo.sockets]
+        .map((sock) => clients.get(sock))
+        .filter((c): c is ClientInfo => c !== undefined && !c.isModerator);
+      const nextOwner =
+        remaining.find((c) => roomInfo.admins.some((a) => a.id === stableUserId(c))) ??
+        remaining[0];
       if (nextOwner) {
         roomInfo.ownerId = stableUserId(nextOwner);
-        void saveRoomRecord(room, {
-          ownerId: roomInfo.ownerId,
-          private: roomInfo.private,
-          flags: roomInfo.flags,
-          code: roomInfo.code,
-        });
+        // No point listing the owner among the people the owner promoted —
+        // isRoomManager already covers them, and the management UI would
+        // otherwise offer to "demote" the person who runs the room.
+        roomInfo.admins = roomInfo.admins.filter((a) => a.id !== roomInfo.ownerId);
+        persistRoomRecord(room, roomInfo);
+        broadcastToRoom(room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
       }
     }
   }
@@ -2918,6 +3015,11 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
                 // roomCodeFromHandle) — the client generated it, and the
                 // URL is what everyone shares.
                 code: isPrivate ? roomCodeFromHandle(room) ?? generateRoomCode() : null,
+                // A brand new room has nobody but its owner running it, and
+                // every action wide open — see roomStore.ts's
+                // DEFAULT_ROOM_PERMISSIONS.
+                admins: [],
+                permissions: { ...DEFAULT_ROOM_PERMISSIONS },
               };
               roomInfo = {
                 sockets: new Set(),
@@ -2956,6 +3058,11 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             peers,
             messages: roomInfo.messages,
             videoSources: roomInfo.videoSources,
+            // Who runs this room and what it currently allows (see
+            // roomSettingsPayload) — folded into the join answer rather than
+            // pushed separately, so the UI never renders a frame where it
+            // doesn't yet know whether this viewer may talk.
+            ...roomSettingsPayload(roomInfo),
           });
           flushPendingSignals(info);
           broadcastToRoom(
@@ -3062,6 +3169,37 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           // only ever sets `sharing`. Either one being true also counts as
           // sharing on its own, so a client that ever stops sending the
           // rolled-up boolean still can't end up marked as not sharing.
+          // Screen and camera are two separate room permissions, so they're
+          // checked separately — a room that allows cameras but not screens
+          // must not turn a camera share away. The breakdown is what decides
+          // that, and it's present whenever *either* half is a boolean (the
+          // same test the state update below uses): a client starting only
+          // its camera sends `camera: true` with no `screen` key at all, and
+          // reading its rolled-up `sharing: true` as a screen share would
+          // block it on a permission it never asked for. Only a client old
+          // enough to send neither falls back to `sharing`, which is exactly
+          // what that flag meant before cameras had their own channel.
+          const hasChannelBreakdown =
+            typeof msg.screen === "boolean" || typeof msg.camera === "boolean";
+          const wantsScreen = hasChannelBreakdown ? Boolean(msg.screen) : Boolean(msg.sharing);
+          const wantsCamera = Boolean(msg.camera);
+          const sharingRoomInfo = rooms.get(info.room);
+          if (sharingRoomInfo) {
+            const denied =
+              wantsScreen && !canUseRoomPermission(sharingRoomInfo, info, "screen")
+                ? ("screen" as const)
+                : wantsCamera && !canUseRoomPermission(sharingRoomInfo, info, "camera")
+                  ? ("camera" as const)
+                  : null;
+            if (denied) {
+              send(socket, {
+                type: "room-permission-denied",
+                permission: denied,
+                message: ROOM_PERMISSION_DENIED_MESSAGE[denied],
+              });
+              return;
+            }
+          }
           const nextSharing = Boolean(msg.sharing) || Boolean(msg.screen) || Boolean(msg.camera);
           // Opens/closes this connection's share-time segment (see
           // flushClientStats) — turning on starts the timer (only if it
@@ -3101,6 +3239,15 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (!info.room) return;
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
           const nextMic = Boolean(msg.mic);
+          const micRoomInfo = rooms.get(info.room);
+          if (nextMic && micRoomInfo && !canUseRoomPermission(micRoomInfo, info, "mic")) {
+            send(socket, {
+              type: "room-permission-denied",
+              permission: "mic",
+              message: ROOM_PERMISSION_DENIED_MESSAGE.mic,
+            });
+            return;
+          }
           // Same open/close-a-segment reasoning as "sharing" above.
           if (nextMic) {
             if (info.micOnAt === undefined) info.micOnAt = Date.now();
@@ -3115,6 +3262,86 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           broadcastToRoom(info.room, { type: "peer-mic", id: info.id, mic: info.mic });
           break;
         }
+        // Room management: who co-runs the room, and what an ordinary member
+        // may do in it (see roomStore.ts's RoomAdmin/RoomPermissions). All
+        // three answer with the same "room-settings" broadcast rather than a
+        // targeted reply — every client's UI depends on these (a disabled mic
+        // button, a hidden GIF picker), so everyone has to hear about a
+        // change, not just whoever made it.
+        case "room-permissions-set": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          // Owner *and* admins — running the room is the whole point of
+          // being promoted. Silently ignored rather than answered with an
+          // error: the control isn't rendered for anyone else, so a message
+          // arriving here from a non-manager isn't an honest mistake.
+          if (!isRoomManager(roomInfo, info)) return;
+          // Merged over what's already set, not replaced: the UI toggles one
+          // switch at a time, and a client that predates a future permission
+          // must not silently reset it by omitting it.
+          const requested = normalizeRoomPermissions({
+            ...roomInfo.permissions,
+            ...(msg.permissions && typeof msg.permissions === "object" ? msg.permissions : {}),
+          });
+          const changed = ROOM_PERMISSION_KEYS.some(
+            (key) => requested[key] !== roomInfo.permissions[key]
+          );
+          if (!changed) return;
+          roomInfo.permissions = requested;
+          persistRoomRecord(info.room, roomInfo);
+          broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+          break;
+        }
+        case "room-admin-add": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          // Only the owner — see isRoomOwner for why admins can't grow their
+          // own ranks.
+          if (!isRoomOwner(roomInfo, info)) return;
+          const userId = typeof msg.userId === "string" ? msg.userId : "";
+          if (!userId || userId === roomInfo.ownerId) return;
+          if (roomInfo.admins.some((a) => a.id === userId)) return;
+          if (roomInfo.admins.length >= MAX_ROOM_ADMINS) {
+            send(socket, {
+              type: "error",
+              message: `Máximo de ${MAX_ROOM_ADMINS} administradores por sala.`,
+            });
+            return;
+          }
+          // Must actually be in the room right now: promoting is a thing you
+          // do to someone you can see in the participant list, and resolving
+          // the name to store alongside the id (see RoomAdmin.name) needs
+          // their live connection anyway.
+          const target = [...roomInfo.sockets]
+            .map((sock) => clients.get(sock))
+            .find(
+              (c): c is ClientInfo =>
+                c !== undefined && !c.isModerator && stableUserId(c) === userId
+            );
+          if (!target || !target.name) return;
+          const admin: RoomAdmin = { id: userId, name: target.name };
+          roomInfo.admins = [...roomInfo.admins, admin];
+          persistRoomRecord(info.room, roomInfo);
+          broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+          break;
+        }
+        case "room-admin-remove": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (!isRoomOwner(roomInfo, info)) return;
+          const userId = typeof msg.userId === "string" ? msg.userId : "";
+          if (!userId || !roomInfo.admins.some((a) => a.id === userId)) return;
+          roomInfo.admins = roomInfo.admins.filter((a) => a.id !== userId);
+          persistRoomRecord(info.room, roomInfo);
+          broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+          break;
+        }
         // Adding, removing and steering a room video source (see
         // RoomVideoSource). All three are ordinary room broadcasts — the
         // server owns the record so that a latecomer's "room-state" already
@@ -3125,6 +3352,14 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (!(await consumeRateLimit(wsVideoSourceLimiter, info.rateLimitKey, "video-source"))) return;
           const roomInfo = rooms.get(info.room);
           if (!roomInfo) return;
+          if (!canUseRoomPermission(roomInfo, info, "videoSource")) {
+            send(socket, {
+              type: "room-permission-denied",
+              permission: "videoSource",
+              message: ROOM_PERMISSION_DENIED_MESSAGE.videoSource,
+            });
+            return;
+          }
           if (roomInfo.videoSources.length >= MAX_ROOM_VIDEO_SOURCES) {
             send(socket, {
               type: "error",
@@ -3268,6 +3503,20 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             return;
           }
           const isGif = msg.kind === "gif";
+          // Text and GIFs are separate switches — a room can keep talking
+          // while turning off the picture wall.
+          const chatRoomInfo = rooms.get(info.room);
+          if (chatRoomInfo) {
+            const chatPermission = isGif ? ("gif" as const) : ("chat" as const);
+            if (!canUseRoomPermission(chatRoomInfo, info, chatPermission)) {
+              send(socket, {
+                type: "room-permission-denied",
+                permission: chatPermission,
+                message: ROOM_PERMISSION_DENIED_MESSAGE[chatPermission],
+              });
+              return;
+            }
+          }
           let chatMessage: ChatMessage;
           if (isGif) {
             const url = typeof msg.url === "string" ? msg.url.trim() : "";
