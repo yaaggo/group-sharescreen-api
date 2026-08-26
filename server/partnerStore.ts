@@ -626,6 +626,34 @@ export async function claimPersistedPartnerReward(
 }
 
 /**
+ * Undoes a claim that claimPersistedPartnerReward just recorded, for the one
+ * case where the payout after it fails (see signaling.ts's claim endpoints):
+ * without this, a transient Redis error between "mark as claimed" and
+ * "credit the points" would burn the claim permanently and the reward could
+ * never be collected — a worse outcome than the double-payout the claim set
+ * exists to prevent, since the retry it invites is exactly what the set
+ * already handles. Safe to call when nothing was recorded.
+ */
+export async function releasePersistedPartnerReward(
+  id: string,
+  subjectId: string,
+  kind: PartnerRewardKind = "video"
+): Promise<void> {
+  if (!id || !subjectId) return;
+  if (!REDIS_URL) {
+    const claims = loadRewardClaimsFromDisk(kind);
+    if (claims[id]?.delete(subjectId)) saveRewardClaimsToDisk(kind);
+    return;
+  }
+  try {
+    const client = await getRedis();
+    await client.sRem(rewardClaimsKey(kind, id), subjectId);
+  } catch (err) {
+    console.error("[partnerStore] Erro ao desfazer resgate de recompensa no Redis:", (err as Error).message);
+  }
+}
+
+/**
  * How many distinct accounts have collected each ad's reward — the admin
  * panel's "quantas pessoas resgataram os pontos" number. Unlike
  * rewardVideoOpens/rewardVideoCompletions (running counts that can double-

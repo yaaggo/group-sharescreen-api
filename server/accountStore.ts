@@ -11,10 +11,10 @@ export interface PublicAccount {
   username: string;
   displayName: string;
   flags: string[];
-  // See accountModels.ts's AccountDoc.points — DB-edited only, for now.
+  // See accountModels.ts's AccountDoc.points — earned from partner ad
+  // rewards, plus direct database edits.
   points: number;
-  // See accountModels.ts's AccountDoc.bio/bannerUrl — same DB-edited-only
-  // story as points.
+  // See accountModels.ts's AccountDoc.bio/bannerUrl — DB-edited only.
   bio: string | null;
   bannerUrl: string | null;
   // See accountModels.ts's AccountDoc — auto-tracked by the signaling

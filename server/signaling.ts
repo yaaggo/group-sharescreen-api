@@ -24,7 +24,8 @@ import {
   parseDeviceReport,
   type ClientPlatform,
 } from "./clientPlatform.js";
-import { signToken, verifyToken, requireAdmin, getBearerToken } from "./auth.js";
+import { signToken, verifyToken, requireAdmin, getBearerToken, type JwtPayload } from "./auth.js";
+import { addGuestPoints, getGuestPoints } from "./guestPointsStore.js";
 import {
   createAccount,
   verifyAccountLogin,
@@ -63,6 +64,7 @@ import {
   recordPersistedPartnerViewer,
   loadPersistedPartnerUniqueCounts,
   claimPersistedPartnerReward,
+  releasePersistedPartnerReward,
   PARTNER_CLICK_REWARD_PLACEMENTS,
   deletePersistedPartnerRewardClaims,
   loadPersistedPartnerRewardClaimCounts,
@@ -2096,21 +2098,56 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     return { partner: picked ? publicPartner(picked) : null };
   });
 
+  // Credits a reward to whoever is claiming it. An account's points live on
+  // its database record (accountStore.ts); a guest's live under its guest id
+  // (guestPointsStore.ts), which is what makes them last exactly as long as
+  // the guest token that names them and no longer. Returns the new total, or
+  // null when the subject couldn't be credited at all — a deleted account, a
+  // Redis hiccup — which the callers below turn into a failed claim rather
+  // than reporting a total nothing actually stored.
+  async function awardRewardPoints(payload: JwtPayload, amount: number): Promise<number | null> {
+    return payload.guest
+      ? addGuestPoints(payload.sub, amount)
+      : addAccountPoints(payload.sub, amount);
+  }
+
+  // A guest identity's points total, for the same header readout an account
+  // gets its own from /auth/me. Deliberately its own tiny endpoint rather
+  // than a field on some existing response: a guest has no /auth/me to hang
+  // it off, and the token is the only thing that can name whose points these
+  // are — nothing else about the connection identifies a guest.
+  app.get("/guest/points", { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } }, async (request, reply) => {
+    const payload = verifyToken(getBearerToken(request.headers.authorization));
+    if (!payload || !payload.guest) {
+      return reply.code(401).send({ error: "Token de convidado inválido." });
+    }
+    return { points: await getGuestPoints(payload.sub) };
+  });
+
   // Pays out a partner ad's watch-to-earn reward (see PartnerRewardModal.tsx
   // — it only calls this once the video's `ended` event fires, having blocked
-  // skipping ahead of it) — requires a real account (guests have nowhere to
-  // hold points, see accountModels.ts), and pays out at most once per
-  // account per ad, enforced server-side (claimPersistedPartnerReward) rather
-  // than trusted from local storage, which is only ever a UI convenience.
+  // skipping ahead of it). Open to guests as well as accounts: a guest's
+  // points have somewhere to live now (see awardRewardPoints above). Pays out
+  // at most once per identity per ad, enforced server-side
+  // (claimPersistedPartnerReward) rather than trusted from local storage,
+  // which is only ever a UI convenience.
+  //
+  // A guest *can* wipe its identity and reach this ad's reward again, since
+  // the claim set remembers the guest id that collected it and the new one is
+  // a stranger. That buys nothing: the same wipe resets the points to zero
+  // (see guestPointsStore.ts's header), so there is no total left to farm
+  // into. What it does affect is the admin panel's "quantas pessoas
+  // resgataram" — that count is distinct *identities*, and a guest who resets
+  // is a second one.
   app.post(
     "/partner/:id/claim-reward",
     { config: { rateLimit: { max: 20, timeWindow: "1 minute" } } },
     async (request, reply) => {
       const payload = verifyToken(getBearerToken(request.headers.authorization));
-      if (!payload || payload.guest) {
+      if (!payload) {
         return reply
           .code(401)
-          .send({ error: "Crie uma conta ou entre em uma para receber pontos assistindo." });
+          .send({ error: "Escolha um nome para entrar antes de resgatar pontos assistindo." });
       }
       const { id } = request.params as { id: string };
       const partner = partnerConfig.partners.find((p) => p.id === id);
@@ -2121,27 +2158,35 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       if (!claimed) {
         return reply.code(409).send({ error: "Você já resgatou essa recompensa." });
       }
-      const points = await addAccountPoints(payload.sub, partner.rewardPoints);
+      const points = await awardRewardPoints(payload, partner.rewardPoints);
+      if (points === null) {
+        // The claim above already went through, so leaving it would burn this
+        // reward for good over a transient failure — hand it back, and let
+        // the retry the message asks for actually work.
+        await releasePersistedPartnerReward(id, payload.sub, "video");
+        return reply.code(503).send({ error: "Não foi possível creditar os pontos. Tente de novo." });
+      }
       return { points };
     }
   );
 
   // The click-to-earn twin of the endpoint above: points for clicking the
-  // ad's CTA. Same one-per-account-per-ad gate, from its own claim set — the
-  // two rewards are independent, so collecting one must never consume the
-  // other. Deliberately does not care *where* the click happened
-  // (clickRewardPlacement is a UI decision about where the points are
-  // offered, and the client is not a source of truth about which button it
-  // rendered); what it enforces is that the ad has a click reward at all.
+  // ad's CTA. Same one-per-identity-per-ad gate (guests included, same as
+  // above), from its own claim set — the two rewards are independent, so
+  // collecting one must never consume the other. Deliberately does not care
+  // *where* the click happened (clickRewardPlacement is a UI decision about
+  // where the points are offered, and the client is not a source of truth
+  // about which button it rendered); what it enforces is that the ad has a
+  // click reward at all.
   app.post(
     "/partner/:id/claim-click-reward",
     { config: { rateLimit: { max: 20, timeWindow: "1 minute" } } },
     async (request, reply) => {
       const payload = verifyToken(getBearerToken(request.headers.authorization));
-      if (!payload || payload.guest) {
+      if (!payload) {
         return reply
           .code(401)
-          .send({ error: "Crie uma conta ou entre em uma para receber pontos clicando." });
+          .send({ error: "Escolha um nome para entrar antes de resgatar pontos clicando." });
       }
       const { id } = request.params as { id: string };
       const partner = partnerConfig.partners.find((p) => p.id === id);
@@ -2152,7 +2197,11 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       if (!claimed) {
         return reply.code(409).send({ error: "Você já resgatou os pontos desse anúncio." });
       }
-      const points = await addAccountPoints(payload.sub, partner.clickRewardPoints);
+      const points = await awardRewardPoints(payload, partner.clickRewardPoints);
+      if (points === null) {
+        await releasePersistedPartnerReward(id, payload.sub, "click");
+        return reply.code(503).send({ error: "Não foi possível creditar os pontos. Tente de novo." });
+      }
       return { points };
     }
   );

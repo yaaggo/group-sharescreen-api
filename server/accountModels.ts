@@ -5,14 +5,17 @@ export interface AccountDoc {
   username: string;
   displayName: string;
   flags: string[];
-  // Cosmetic score shown in the room header (see WatchRoom's top bar). No
-  // in-app way to earn it yet — only ever changed by hand directly in the
-  // database, which is also why it lives at the top level (not under
+  // Cosmetic score shown in the room header (see WatchRoom's top bar).
+  // Earned by claiming a partner ad's reward (see signaling.ts's
+  // /partner/:id/claim-reward), and otherwise changed by hand directly in
+  // the database — which is why it lives at the top level (not under
   // `account`) alongside the other fields a plain admin edit might touch.
+  // A guest earns the same rewards, but has no document to hold them; see
+  // guestPointsStore.ts for where those go instead.
   points: number;
-  // Public profile page content (see app/user/[id]/page.tsx) — same
-  // DB-edited-only story as `points` for now: nothing in the app writes
-  // these yet, they just render if someone sets them by hand.
+  // Public profile page content (see app/user/[id]/page.tsx) — DB-edited
+  // only: unlike `points` above, nothing in the app writes these yet, they
+  // just render if someone sets them by hand.
   bio: string | null;
   bannerUrl: string | null;
   // Cumulative time, in whole seconds, tracked automatically by the
