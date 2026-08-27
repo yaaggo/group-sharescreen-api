@@ -433,8 +433,20 @@ export interface RoomVideoSource {
   // for a "twitch"/"kick" one — never the URL someone pasted: parsed and
   // validated here (see parseYouTubeVideoId/parseTwitchChannel/parseKickChannel)
   // so no client can talk another client's embed into loading an arbitrary
-  // address.
+  // address. For a playlist-only YouTube URL (no `v=`), this is the playlist
+  // id itself — the embed keys off `playlistId` below rather than treating
+  // this as a video.
   videoId: string;
+  // YouTube playlist id when the pasted URL carried a `list=` (watch?v=&list=,
+  // /playlist?list=, youtu.be/?list=). The embed loads this as listType=playlist
+  // so the room watches the queue, not just the opening video. Absent for a
+  // single video and for Twitch/Kick.
+  playlistId?: string;
+  // Which item in that playlist is playing, 0-based — same meaning as
+  // YT.Player.getPlaylistIndex. Playback state, not identity: it moves as
+  // the queue advances, via "video-source-state", the same way
+  // positionSeconds does. Absent when there is no playlist.
+  playlistIndex?: number;
   // Whoever added it — always the one "video-source-remove" and the
   // leaveRoom cleanup below key off, regardless of controlMode. Steering
   // (play/pause/seek, in the "video-source-state" handler) is keyed off this
@@ -671,6 +683,33 @@ const MAX_ROOM_VIDEO_SOURCES = 4;
 // not a product limit anyone realistically runs into.
 const MAX_ROOM_ADMINS = 50;
 const YOUTUBE_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+// User-created (PL), channel uploads (UU), favorites (FL), albums (OLAK5uy_),
+// and Mix/radio (RD). Watch Later (WL) and Liked (LL) are per-account and
+// cannot be embedded, so they're refused rather than accepted only to fail
+// in every iframe.
+const YOUTUBE_PLAYLIST_ID_RE = /^(PL|UU|FL|OLAK5uy_|RD)[A-Za-z0-9_-]{10,128}$/;
+
+function isYouTubeHost(host: string): boolean {
+  return (
+    host === "youtu.be" ||
+    host === "youtube.com" ||
+    host === "m.youtube.com" ||
+    host === "music.youtube.com" ||
+    host === "youtube-nocookie.com"
+  );
+}
+
+function parseYouTubeUrl(raw: string): URL | null {
+  const trimmed = raw.trim();
+  let url: URL;
+  try {
+    url = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`);
+  } catch {
+    return null;
+  }
+  const host = url.hostname.replace(/^www\./, "").toLowerCase();
+  return isYouTubeHost(host) ? url : null;
+}
 
 // Accepts anything someone is likely to paste — a watch URL, youtu.be, an
 // embed/live/shorts path, or the bare id — and returns the id, or null if it
@@ -679,26 +718,40 @@ const YOUTUBE_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 function parseYouTubeVideoId(raw: string): string | null {
   const trimmed = raw.trim();
   if (YOUTUBE_VIDEO_ID_RE.test(trimmed)) return trimmed;
-  let url: URL;
-  try {
-    url = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`);
-  } catch {
-    return null;
-  }
+  const url = parseYouTubeUrl(trimmed);
+  if (!url) return null;
   const host = url.hostname.replace(/^www\./, "").toLowerCase();
   let id: string | null = null;
   if (host === "youtu.be") {
     id = url.pathname.split("/")[1] ?? null;
-  } else if (host === "youtube.com" || host === "m.youtube.com" || host === "music.youtube.com" || host === "youtube-nocookie.com") {
-    if (url.pathname === "/watch") id = url.searchParams.get("v");
-    else {
-      const [, section, value] = url.pathname.split("/");
-      if (section === "embed" || section === "live" || section === "shorts" || section === "v") {
-        id = value ?? null;
-      }
+  } else if (url.pathname === "/watch") {
+    id = url.searchParams.get("v");
+  } else {
+    const [, section, value] = url.pathname.split("/");
+    if (section === "embed" || section === "live" || section === "shorts" || section === "v") {
+      id = value ?? null;
     }
   }
   return id && YOUTUBE_VIDEO_ID_RE.test(id) ? id : null;
+}
+
+// Twin of the client's parseYouTubePlaylistId. A watch URL with both `v=`
+// and `list=` yields the list id here and the video id from
+// parseYouTubeVideoId — see parseYouTubeSource.
+function parseYouTubePlaylistId(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (YOUTUBE_PLAYLIST_ID_RE.test(trimmed)) return trimmed;
+  const url = parseYouTubeUrl(trimmed);
+  if (!url) return null;
+  const list = url.searchParams.get("list");
+  return list && YOUTUBE_PLAYLIST_ID_RE.test(list) ? list : null;
+}
+
+function parseYouTubeSource(raw: string): { videoId: string | null; playlistId: string | null } | null {
+  const videoId = parseYouTubeVideoId(raw);
+  const playlistId = parseYouTubePlaylistId(raw);
+  if (!videoId && !playlistId) return null;
+  return { videoId, playlistId };
 }
 
 // Twitch login names: 4-25 characters, letters/digits/underscore, never
@@ -756,7 +809,10 @@ function parseVideoSourceKind(raw: unknown): RoomVideoSource["kind"] | null {
 }
 
 function parseVideoSourceId(kind: RoomVideoSource["kind"], rawUrl: string): string | null {
-  if (kind === "youtube") return parseYouTubeVideoId(rawUrl);
+  if (kind === "youtube") {
+    const parsed = parseYouTubeSource(rawUrl);
+    return parsed ? parsed.videoId || parsed.playlistId : null;
+  }
   if (kind === "twitch") return parseTwitchChannel(rawUrl);
   return parseKickChannel(rawUrl);
 }
@@ -3498,7 +3554,10 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             return;
           }
           const rawUrl = typeof msg.url === "string" ? msg.url : "";
-          const videoId = parseVideoSourceId(kind, rawUrl);
+          const youtube = kind === "youtube" ? parseYouTubeSource(rawUrl) : null;
+          const videoId = youtube
+            ? youtube.videoId || youtube.playlistId
+            : parseVideoSourceId(kind, rawUrl);
           if (!videoId) {
             send(socket, {
               type: "error",
@@ -3515,6 +3574,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             id: genId(),
             kind,
             videoId,
+            ...(youtube?.playlistId ? { playlistId: youtube.playlistId } : {}),
             addedById: stableUserId(info),
             addedByName: info.name,
             // Twitch/Kick live embeds always show native chrome, so "only the
@@ -3586,6 +3646,18 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (hasOwn(msg, "playbackRate")) {
             source.playbackRate = normalizePlaybackRate(msg.playbackRate);
           }
+          // Same merge-if-present as playbackRate: an older client never
+          // sends this, and a non-playlist source has none. Index 0 is a
+          // real position (the first item) so it must not be treated as
+          // absent. Capped rather than rejected — a bogus index is cheaper
+          // to ignore on the player (getPlaylistIndex just won't match) than
+          // dropping the whole play/pause/seek that rode with it.
+          if (hasOwn(msg, "playlistIndex")) {
+            const rawIndex = typeof msg.playlistIndex === "number" ? msg.playlistIndex : NaN;
+            if (Number.isFinite(rawIndex) && rawIndex >= 0) {
+              source.playlistIndex = Math.min(Math.floor(rawIndex), 10_000);
+            }
+          }
           source.updatedAt = Date.now();
           broadcastToRoom(info.room, {
             type: "video-source-state",
@@ -3594,6 +3666,9 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             positionSeconds: source.positionSeconds,
             playbackRate: source.playbackRate,
             updatedAt: source.updatedAt,
+            ...(typeof source.playlistIndex === "number"
+              ? { playlistIndex: source.playlistIndex }
+              : {}),
           });
           break;
         }
