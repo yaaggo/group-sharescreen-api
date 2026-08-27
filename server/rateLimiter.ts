@@ -20,9 +20,13 @@ const buckets = new Map<string, Bucket>();
 const BUCKET_IDLE_MS = 5 * 60_000;
 const SWEEP_INTERVAL_MS = 60_000;
 setInterval(() => {
-  const now = Date.now();
-  for (const [key, bucket] of buckets) {
-    if (now - bucket.windowStart > BUCKET_IDLE_MS) buckets.delete(key);
+  try {
+    const now = Date.now();
+    for (const [key, bucket] of buckets) {
+      if (now - bucket.windowStart > BUCKET_IDLE_MS) buckets.delete(key);
+    }
+  } catch (err) {
+    console.error("[rate-limiter] Falha na varredura de buckets:", err);
   }
 }, SWEEP_INTERVAL_MS).unref();
 
