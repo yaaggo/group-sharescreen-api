@@ -418,9 +418,8 @@ interface ClientInfo {
 // the in-memory-only ones, is what lets leaveRoom's ownership handoff and
 // the "join" handler's room-creation save the *whole* persisted record back
 // with a plain object spread instead of having to know which fields matter.
-// A video someone added to the room from an external service — a YouTube
-// video/livestream or a Twitch channel today, the `kind` tag is what keeps
-// room for the next one. It is *not* a WebRTC transmission: nothing streams
+// A video someone added to the room from an external service — YouTube,
+// Twitch or Kick today; the `kind` tag is what keeps room for the next one. It is *not* a WebRTC transmission: nothing streams
 // through this server or between peers. Every client embeds the same video
 // itself, and what actually travels is this little record — which video,
 // whether it's playing, and where it is — so that everyone's player lands
@@ -429,11 +428,12 @@ interface ClientInfo {
 // period) and is gone with it.
 export interface RoomVideoSource {
   id: string;
-  kind: "youtube" | "twitch";
+  kind: "youtube" | "twitch" | "kick";
   // The 11-character YouTube id for a "youtube" source, or the channel login
-  // for a "twitch" one — never the URL someone pasted: parsed and validated
-  // here (see parseYouTubeVideoId/parseTwitchChannel) so no client can talk
-  // another client's embed into loading an arbitrary address.
+  // for a "twitch"/"kick" one — never the URL someone pasted: parsed and
+  // validated here (see parseYouTubeVideoId/parseTwitchChannel/parseKickChannel)
+  // so no client can talk another client's embed into loading an arbitrary
+  // address.
   videoId: string;
   // Whoever added it — always the one "video-source-remove" and the
   // leaveRoom cleanup below key off, regardless of controlMode. Steering
@@ -726,6 +726,39 @@ function parseTwitchChannel(raw: string): string | null {
   if (segments.length !== 1) return null;
   const channel = segments[0];
   return TWITCH_CHANNEL_RE.test(channel) ? channel : null;
+}
+
+// Kick slugs: 3-25 letters/digits/underscore. Slightly wider than Twitch
+// (Kick allows a leading digit). Same live-channel-only rule: extra path
+// segments (VODs, clips) are rejected rather than guessed at.
+const KICK_CHANNEL_RE = /^[A-Za-z0-9_]{3,25}$/;
+
+function parseKickChannel(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (KICK_CHANNEL_RE.test(trimmed)) return trimmed;
+  let url: URL;
+  try {
+    url = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`);
+  } catch {
+    return null;
+  }
+  const host = url.hostname.replace(/^www\./, "").replace(/^m\./, "").toLowerCase();
+  if (host !== "kick.com" && host !== "player.kick.com") return null;
+  const segments = url.pathname.split("/").filter(Boolean);
+  if (segments.length !== 1) return null;
+  const channel = segments[0];
+  return KICK_CHANNEL_RE.test(channel) ? channel : null;
+}
+
+function parseVideoSourceKind(raw: unknown): RoomVideoSource["kind"] | null {
+  if (raw === "youtube" || raw === "twitch" || raw === "kick") return raw;
+  return null;
+}
+
+function parseVideoSourceId(kind: RoomVideoSource["kind"], rawUrl: string): string | null {
+  if (kind === "youtube") return parseYouTubeVideoId(rawUrl);
+  if (kind === "twitch") return parseTwitchChannel(rawUrl);
+  return parseKickChannel(rawUrl);
 }
 
 function hasOwn(obj: Record<string, unknown>, key: string): boolean {
@@ -3447,13 +3480,22 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             });
             return;
           }
-          const kind = msg.kind === "twitch" ? "twitch" : "youtube";
+          const kind = parseVideoSourceKind(msg.kind);
+          if (!kind) {
+            send(socket, { type: "error", message: "Plataforma de vídeo inválida." });
+            return;
+          }
           const rawUrl = typeof msg.url === "string" ? msg.url : "";
-          const videoId = kind === "twitch" ? parseTwitchChannel(rawUrl) : parseYouTubeVideoId(rawUrl);
+          const videoId = parseVideoSourceId(kind, rawUrl);
           if (!videoId) {
             send(socket, {
               type: "error",
-              message: kind === "twitch" ? "Link da Twitch inválido." : "Link do YouTube inválido.",
+              message:
+                kind === "kick"
+                  ? "Link da Kick inválido."
+                  : kind === "twitch"
+                    ? "Link da Twitch inválido."
+                    : "Link do YouTube inválido.",
             });
             return;
           }
@@ -3463,7 +3505,14 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             videoId,
             addedById: stableUserId(info),
             addedByName: info.name,
-            controlMode: msg.controlMode === "anyone" ? "anyone" : "owner",
+            // Twitch/Kick live embeds always show native chrome, so "only the
+            // adder steers" is unenforceable — force the wheel open.
+            controlMode:
+              kind === "twitch" || kind === "kick"
+                ? "anyone"
+                : msg.controlMode === "anyone"
+                  ? "anyone"
+                  : "owner",
             // Starts playing: someone who just added a video meant to watch
             // it, and a source that arrives paused at 0 makes everyone wait
             // for whoever added it to press play again.
