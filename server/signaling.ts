@@ -1780,13 +1780,17 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       else if (fresh.length !== queue.length) pendingSignals.set(targetId, fresh);
     }
     for (const info of clients.values()) {
-      if (!info.isAlive) {
-        heartbeatReapedTotal.inc();
-        info.socket.terminate();
-        continue;
+      try {
+        if (!info.isAlive) {
+          heartbeatReapedTotal.inc();
+          info.socket.terminate();
+          continue;
+        }
+        info.isAlive = false;
+        info.socket.ping();
+      } catch (err) {
+        app.log.error(err, "heartbeat: falha ao pingar/terminar socket");
       }
-      info.isAlive = false;
-      info.socket.ping();
     }
   }, HEARTBEAT_INTERVAL_MS);
 
