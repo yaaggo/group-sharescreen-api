@@ -1510,11 +1510,19 @@ function scheduleRoomDeletion(room: string) {
   clearRoomDeletionTimer(room);
   const timer = setTimeout(() => {
     roomDeletionTimers.delete(room);
-    const roomInfo = rooms.get(room);
-    if (roomInfo && roomInfo.sockets.size === 0) {
-      rooms.delete(room);
-      deletePersistedChat(room);
-      void deleteRoomRecord(room);
+    try {
+      const roomInfo = rooms.get(room);
+      if (roomInfo && roomInfo.sockets.size === 0) {
+        rooms.delete(room);
+        deletePersistedChat(room).catch((err) => {
+          console.error(`[room-deletion] Falha ao apagar chat persistido de "${room}":`, err);
+        });
+        deleteRoomRecord(room).catch((err) => {
+          console.error(`[room-deletion] Falha ao apagar registro da sala "${room}":`, err);
+        });
+      }
+    } catch (err) {
+      console.error(`[room-deletion] Falha ao processar exclusão da sala "${room}":`, err);
     }
   }, ROOM_DELETION_GRACE_MS);
   roomDeletionTimers.set(room, timer);
@@ -1780,13 +1788,17 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       else if (fresh.length !== queue.length) pendingSignals.set(targetId, fresh);
     }
     for (const info of clients.values()) {
-      if (!info.isAlive) {
-        heartbeatReapedTotal.inc();
-        info.socket.terminate();
-        continue;
+      try {
+        if (!info.isAlive) {
+          heartbeatReapedTotal.inc();
+          info.socket.terminate();
+          continue;
+        }
+        info.isAlive = false;
+        info.socket.ping();
+      } catch (err) {
+        app.log.error(err, "heartbeat: falha ao pingar/terminar socket");
       }
-      info.isAlive = false;
-      info.socket.ping();
     }
   }, HEARTBEAT_INTERVAL_MS);
 

@@ -33,6 +33,15 @@ const METRICS_TOKEN = process.env.METRICS_TOKEN || null;
 
 const CURRENT_ID = randomUUID()
 
+process.on("uncaughtException", (err) => {
+  console.error("[fatal] uncaughtException:", err);
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[fatal] unhandledRejection:", reason);
+  process.exit(1);
+});
+
 async function main() {
   // trustProxy: this always runs behind a reverse proxy in production (see
   // README — apigolive.nemtudo.me), so request.ip needs to read the real
