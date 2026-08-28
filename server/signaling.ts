@@ -1940,6 +1940,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       return { exists: (await loadRoomRecord(handle)) !== null };
     }
   );
+  
 
   // Account system: create/login work for anyone, no auth required going
   // in. Admin is no longer a separate Basic-Auth credential (see the old
