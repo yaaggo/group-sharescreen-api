@@ -1503,6 +1503,13 @@ function peerSummary(info: ClientInfo) {
     // for a guest it's a guest id, not an account, and GET /users/:id below
     // would just 404 on it.
     userId: stableUserId(info),
+    // Connected through the desktop app instead of a browser tab — the same
+    // classification /metrics counts (see clientPlatform.ts), which for this
+    // bucket is either the client's own bridge check or an "Electron/"
+    // User-Agent. Half of it is client-reported and therefore forgeable,
+    // which is fine for a badge in the participant list and would not be for
+    // anything gated on it.
+    app: info.platform === "desktop-app",
     ...(info.isModerator ? { role: "moderator" as const } : {}),
   };
 }
