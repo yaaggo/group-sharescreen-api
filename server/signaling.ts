@@ -15,6 +15,7 @@ import {
   turnstileVerificationsTotal,
   emptyPlatformStats,
   type LocationStats,
+  type WorkerStats,
 } from "./metrics.js";
 import { recordViolation } from "./rateLimiter.js";
 import { verifyTurnstileToken, TURNSTILE_ENABLED } from "./turnstile.js";
@@ -117,6 +118,13 @@ import {
   wsVideoSourceLimiter,
   consumeRateLimit,
 } from "./rateLimiter.js";
+import {
+  CLUSTER_ENABLED,
+  WORKER_ID,
+  busPublish,
+  busSendTo,
+  onBus,
+} from "./clusterBus.js";
 
 const HANDLE_RE = /^[a-zA-Z0-9_-]{1,32}$/;
 const CLIENT_ID_RE = /^[a-zA-Z0-9-]{8,64}$/;
@@ -172,7 +180,12 @@ const TURNSTILE_REVERIFY_INTERVAL_MS = 30 * 60_000;
 const turnstileVerifiedIps = new Map<string, number>();
 
 function markTurnstileVerified(ip: string) {
-  turnstileVerifiedIps.set(ip, Date.now());
+  const at = Date.now();
+  turnstileVerifiedIps.set(ip, at);
+  // A reconnect lands on whichever worker the OS hands it to, so a solve
+  // remembered only here would still challenge the same person again moments
+  // later — exactly the problem keying this by IP exists to fix.
+  clusterEvent("turnstile:verified", { ip, at });
 }
 
 function isTurnstileFreshForIp(ip: string): boolean {
@@ -391,6 +404,19 @@ interface ClientInfo {
   // fake it — so it's strictly an extra handle for moderation, never an
   // identity anything is trusted on.
   fingerprint?: string;
+  // Which worker of the cluster actually terminates this socket (see
+  // clusterPrimary.ts). Always WORKER_ID for a connection this process owns;
+  // anything else means `socket` is a RemoteSocket standing in for one held
+  // by another worker. 0 when not clustered — there is only the one process
+  // then, so every connection is local by definition.
+  worker: number;
+  // Stable identity of this *socket* across the cluster, and the address
+  // every replicated event and every routed socket write is keyed on.
+  // Deliberately separate from `id`, for the same reason rateLimitKey is:
+  // `id` can be reassigned mid-life when this connection reclaims a previous
+  // session's clientId, and the routing key for one physical socket must not
+  // move when that happens.
+  connKey: string;
   // Stable per-connection key for the message-rate limiters in
   // rateLimiter.ts — set once at connect time and never touched again.
   // Deliberately *not* the same as `id`: `id` can be reassigned mid-life
@@ -1092,6 +1118,686 @@ const PENDING_SIGNAL_TTL_MS = 15_000;
 const MAX_PENDING_SIGNALS_PER_TARGET = 32;
 const pendingSignals = new Map<string, PendingSignal[]>();
 
+// ─────────────────────────────────────────────────────────────────────────
+// Cluster replication
+//
+// Everything above this line assumes one process owns every connection and
+// every room. Under node:cluster (see clusterPrimary.ts) that stops being
+// true — the OS hands each incoming socket to whichever worker it likes, so
+// two people in the same room are routinely in two different processes.
+//
+// The approach taken here is that *every worker keeps a complete replica of
+// the whole cluster's state*: `clients`, `clientsById` and `rooms` above are
+// cluster-wide on every worker, not per-process. A connection this worker
+// actually terminates carries its real `ws` socket; every other worker's
+// connections are present too, as ordinary ClientInfo entries whose `socket`
+// is a RemoteSocket that forwards writes to the worker that owns it.
+//
+// That is what makes the rest of this file work untouched. realPeopleCount,
+// broadcastToRoom, the peers array in "room-state", GET /stats, GET /rooms,
+// GET /admin/rooms, the per-room name reservations, deliverOrQueueSignal —
+// none of them know or care that half the sockets they are iterating live in
+// another process, because a RemoteSocket answers readyState/send/close the
+// same way a real one does. Two people on different workers therefore see
+// exactly the same room, the same peer list and the same online count as two
+// people on the same worker.
+//
+// Writes are replicated, not shared: the worker handling a message applies
+// the change to its own copy (synchronously, as before) and publishes it, and
+// every other worker applies the same change to its replica. Only the worker
+// that owns a connection ever publishes updates about it, so a client's own
+// fields have exactly one writer and can never conflict. Room membership and
+// name reservations travel as add/remove events (each carrying the client it
+// refers to, so it can never arrive before the client it needs), and the
+// room's record — owner, admins, permissions, description — is last-write-
+// wins, which is fine for something only a manager clicking a switch changes.
+//
+// Side effects deliberately stay with the worker that handled the message: it
+// is the one that writes to Redis/Mongo, credits account time and counts the
+// Prometheus event. Replicas only ever update memory. That keeps every
+// persisted write single-origin, exactly as it was with one process.
+
+// A connection that lives on another worker. Implements just the slice of the
+// `ws` API this file ever uses on a socket, so a ClientInfo holding one is
+// indistinguishable from a local connection to every caller above. Writes are
+// batched per destination worker and flushed on the same tick (see
+// flushClusterOutbox) rather than sent one IPC message at a time — a
+// broadcast into a 40-person room is one message per worker, not per person.
+class RemoteSocket {
+  readonly OPEN = 1;
+  // Always "open": the owning worker is the only place that knows otherwise,
+  // and it removes the client from every replica the moment its socket closes
+  // (see publishClientRemoval). Anything sent in that gap is dropped over
+  // there, which is exactly what send() already does for a closing local
+  // socket.
+  readyState = 1;
+  constructor(
+    readonly workerId: number,
+    readonly connKey: string
+  ) {}
+  send(data: string): void {
+    let batch = remoteSendBatches.get(this.workerId);
+    if (!batch) {
+      batch = [];
+      remoteSendBatches.set(this.workerId, batch);
+    }
+    batch.push([this.connKey, data]);
+    scheduleClusterFlush();
+  }
+  close(code?: number, reason?: string): void {
+    busSendTo(this.workerId, "ws:close", { connKey: this.connKey, code, reason });
+  }
+  terminate(): void {
+    busSendTo(this.workerId, "ws:terminate", { connKey: this.connKey });
+  }
+  // The heartbeat only ever pings connections this worker owns (see the sweep
+  // in registerSignalingRoutes), so this is never reached — it exists so the
+  // shape matches a real socket and a future caller cannot trip over it.
+  ping(): void {}
+}
+
+// Everything about a connection except the socket itself and `isAlive`, which
+// is meaningless off its own worker (the heartbeat that maintains it runs
+// where the real socket is). `inClientsById` carries the one piece of state
+// that is not a field on ClientInfo: whether this connection currently holds
+// its id in the `clientsById` index, which only happens once it has
+// registered a name.
+type ClientSnapshot = Omit<ClientInfo, "socket" | "isAlive"> & { inClientsById: boolean };
+
+// Every connection in the cluster, keyed by the stable per-socket key that
+// survives a clientId reclaim (see ClientInfo.connKey) — this is what an
+// incoming replication event or a routed socket write resolves through, since
+// `id` can be reassigned mid-life and a socket object obviously cannot cross
+// a process boundary.
+const clientsByConnKey = new Map<string, ClientInfo>();
+
+function isLocalClient(info: ClientInfo): boolean {
+  return info.worker === WORKER_ID;
+}
+
+const remoteSendBatches = new Map<number, [string, string][]>();
+const dirtyClients = new Set<ClientInfo>();
+const pendingClusterEvents: { topic: string; payload: unknown }[] = [];
+let clusterFlushScheduled = false;
+
+function scheduleClusterFlush(): void {
+  if (clusterFlushScheduled) return;
+  clusterFlushScheduled = true;
+  // nextTick rather than a timer: everything queued while handling one
+  // message goes out together, before the process touches I/O again, so a
+  // replica never learns of a change later than the socket write announcing
+  // it.
+  process.nextTick(flushClusterOutbox);
+}
+
+function flushClusterOutbox(): void {
+  clusterFlushScheduled = false;
+  // Client snapshots first: a room event may name a client, and although each
+  // one carries its own copy for exactly that reason, sending the canonical
+  // state ahead of the events referencing it keeps a replica from briefly
+  // holding a stale view of someone who just changed.
+  if (dirtyClients.size > 0) {
+    for (const info of dirtyClients) busPublish("client:upsert", clientSnapshot(info));
+    dirtyClients.clear();
+  }
+  if (pendingClusterEvents.length > 0) {
+    for (const event of pendingClusterEvents) busPublish(event.topic, event.payload);
+    pendingClusterEvents.length = 0;
+  }
+  if (remoteSendBatches.size > 0) {
+    for (const [workerId, batch] of remoteSendBatches) busSendTo(workerId, "ws:send", batch);
+    remoteSendBatches.clear();
+  }
+}
+
+function clusterEvent(topic: string, payload: unknown): void {
+  if (!CLUSTER_ENABLED) return;
+  pendingClusterEvents.push({ topic, payload });
+  scheduleClusterFlush();
+}
+
+function clientSnapshot(info: ClientInfo): ClientSnapshot {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { socket, isAlive, ...rest } = info;
+  return { ...rest, inClientsById: clientsById.get(info.id) === info };
+}
+
+// Marks a connection this worker owns as needing to be re-published. Called
+// once after every handled message rather than at each individual field
+// write, so no handler above has to remember to announce what it changed.
+function syncClient(info: ClientInfo): void {
+  if (!CLUSTER_ENABLED || !isLocalClient(info)) return;
+  dirtyClients.add(info);
+  scheduleClusterFlush();
+}
+
+function publishClientRemoval(info: ClientInfo): void {
+  if (!CLUSTER_ENABLED) return;
+  dirtyClients.delete(info);
+  clusterEvent("client:remove", { connKey: info.connKey });
+}
+
+function roomRecordOf(roomInfo: RoomInfo): RoomRecord {
+  return {
+    ownerId: roomInfo.ownerId,
+    private: roomInfo.private,
+    flags: roomInfo.flags,
+    code: roomInfo.code,
+    admins: roomInfo.admins,
+    permissions: roomInfo.permissions,
+    location: roomInfo.location,
+    description: roomInfo.description,
+    category: roomInfo.category,
+  };
+}
+
+function publishRoomCreated(room: string, roomInfo: RoomInfo): void {
+  clusterEvent("room:create", {
+    room,
+    record: roomRecordOf(roomInfo),
+    createdAt: roomInfo.createdAt,
+    messages: roomInfo.messages,
+    videoSources: roomInfo.videoSources,
+  });
+}
+
+function publishRoomRecord(room: string, roomInfo: RoomInfo): void {
+  clusterEvent("room:record", { room, record: roomRecordOf(roomInfo) });
+}
+
+function publishRoomVideoSources(room: string, roomInfo: RoomInfo): void {
+  clusterEvent("room:video", { room, videoSources: roomInfo.videoSources });
+}
+
+function publishRoomChat(room: string, message: ChatMessage): void {
+  clusterEvent("room:chat", { room, message });
+}
+
+function publishRoomRemoved(room: string): void {
+  clusterEvent("room:remove", { room });
+}
+
+// Membership carries the joiner's/leaver's whole snapshot so a replica can
+// materialize a client it has never heard of and put it in the room in one
+// step — there is no arrival order to get wrong.
+function publishRoomMember(room: string, info: ClientInfo, present: boolean): void {
+  if (!CLUSTER_ENABLED) return;
+  clusterEvent("room:member", { room, present, client: clientSnapshot(info) });
+}
+
+function publishRoomName(room: string, key: string, info: ClientInfo | null): void {
+  if (!CLUSTER_ENABLED) return;
+  clusterEvent("room:name", { room, key, client: info ? clientSnapshot(info) : null });
+}
+
+function applyClientSnapshot(snap: ClientSnapshot): ClientInfo | undefined {
+  // Our own connections are never replicated back to us (the primary relays
+  // to everyone but the sender), so this only guards against a stray event.
+  if (snap.worker === WORKER_ID) return clientsByConnKey.get(snap.connKey);
+  const { inClientsById, ...fields } = snap;
+  let info = clientsByConnKey.get(snap.connKey);
+  if (!info) {
+    const socket = new RemoteSocket(snap.worker, snap.connKey) as unknown as WebSocket;
+    info = { ...fields, socket, isAlive: true } as ClientInfo;
+    clients.set(socket, info);
+    clientsByConnKey.set(snap.connKey, info);
+  } else {
+    // The socket object is deliberately kept across updates: a room's `names`
+    // map and its `sockets` set are both keyed by it, so replacing it would
+    // orphan every reference this worker already holds.
+    if (info.id !== snap.id && clientsById.get(info.id) === info) clientsById.delete(info.id);
+    Object.assign(info, fields);
+  }
+  if (inClientsById) clientsById.set(info.id, info);
+  else if (clientsById.get(info.id) === info) clientsById.delete(info.id);
+  return info;
+}
+
+// Drops the replica of a connection that ended on its own worker.
+// Deliberately silent: the worker that owned it already ran leaveRoom and
+// broadcast the resulting "peer-left" to the whole cluster (its
+// broadcastToRoom reaches every socket in the room, local or remote), so
+// repeating any of that here would send it twice.
+function applyClientRemoval(connKey: string): void {
+  const info = clientsByConnKey.get(connKey);
+  if (!info) return;
+  clientsByConnKey.delete(connKey);
+  clients.delete(info.socket);
+  if (clientsById.get(info.id) === info) clientsById.delete(info.id);
+  if (info.room) {
+    const roomInfo = rooms.get(info.room);
+    if (roomInfo) {
+      roomInfo.sockets.delete(info.socket);
+      const key = info.name ? info.name.toLowerCase() : null;
+      if (key && roomInfo.names.get(key) === info.socket) roomInfo.names.delete(key);
+    }
+  }
+}
+
+if (CLUSTER_ENABLED) {
+  onBus("client:upsert", (snap: ClientSnapshot) => {
+    applyClientSnapshot(snap);
+  });
+
+  onBus("client:remove", ({ connKey }: { connKey: string }) => {
+    applyClientRemoval(connKey);
+  });
+
+  // A reconnect can land on a different worker than the session it is
+  // reclaiming (see the detachSession calls in "register" and "join"). The
+  // bookkeeping has to happen on the *owning* worker, because only there does
+  // clearing info.room stop the imminent close event from broadcasting a
+  // "peer-left" for an identity that never actually left — which is the whole
+  // reason detachSession exists.
+  onBus("client:detach", ({ connKey }: { connKey: string }) => {
+    const info = clientsByConnKey.get(connKey);
+    if (info && isLocalClient(info)) detachSessionOnOwner(info);
+  });
+
+  // Socket writes routed here from another worker's RemoteSocket.
+  onBus("ws:send", (batch: [string, string][]) => {
+    for (const [connKey, data] of batch) {
+      const info = clientsByConnKey.get(connKey);
+      if (!info || !isLocalClient(info)) continue;
+      if (info.socket.readyState === info.socket.OPEN) info.socket.send(data);
+    }
+  });
+
+  onBus(
+    "ws:close",
+    ({ connKey, code, reason }: { connKey: string; code?: number; reason?: string }) => {
+      const info = clientsByConnKey.get(connKey);
+      if (info && isLocalClient(info)) info.socket.close(code, reason);
+    }
+  );
+
+  onBus("ws:terminate", ({ connKey }: { connKey: string }) => {
+    const info = clientsByConnKey.get(connKey);
+    if (info && isLocalClient(info)) info.socket.terminate();
+  });
+
+  onBus(
+    "room:create",
+    ({
+      room,
+      record,
+      createdAt,
+      messages,
+      videoSources,
+    }: {
+      room: string;
+      record: RoomRecord;
+      createdAt: number;
+      messages: ChatMessage[];
+      videoSources: RoomVideoSource[];
+    }) => {
+      const existing = rooms.get(room);
+      if (!existing) {
+        rooms.set(room, {
+          sockets: new Set(),
+          createdAt,
+          messages,
+          names: new Map(),
+          videoSources,
+          ...record,
+        });
+        return;
+      }
+      // Two people can create the same brand-new room in the same instant on
+      // two different workers, and each would name itself the owner. Both
+      // sides resolve that the same way — oldest wins, ties broken on owner
+      // id — so they converge on one answer instead of each keeping its own.
+      const incomingWins =
+        createdAt < existing.createdAt ||
+        (createdAt === existing.createdAt && (record.ownerId ?? "") < (existing.ownerId ?? ""));
+      if (!incomingWins) return;
+      existing.createdAt = createdAt;
+      Object.assign(existing, record);
+    }
+  );
+
+  onBus("room:record", ({ room, record }: { room: string; record: RoomRecord }) => {
+    const roomInfo = rooms.get(room);
+    if (roomInfo) Object.assign(roomInfo, record);
+  });
+
+  onBus("room:video", ({ room, videoSources }: { room: string; videoSources: RoomVideoSource[] }) => {
+    const roomInfo = rooms.get(room);
+    if (roomInfo) roomInfo.videoSources = videoSources;
+  });
+
+  onBus("room:chat", ({ room, message }: { room: string; message: ChatMessage }) => {
+    const roomInfo = rooms.get(room);
+    if (!roomInfo) return;
+    roomInfo.messages.push(message);
+    if (roomInfo.messages.length > ROOM_CHAT_HISTORY_LIMIT) {
+      roomInfo.messages.splice(0, roomInfo.messages.length - ROOM_CHAT_HISTORY_LIMIT);
+    }
+  });
+
+  onBus("room:remove", ({ room }: { room: string }) => {
+    clearRoomDeletionTimer(room);
+    rooms.delete(room);
+  });
+
+  onBus(
+    "room:member",
+    ({ room, present, client }: { room: string; present: boolean; client: ClientSnapshot }) => {
+      const roomInfo = rooms.get(room);
+      if (!roomInfo) return;
+      if (present) {
+        // Materializing the client from the snapshot the event carries is
+        // what makes membership immune to arrival order — there is no
+        // "client not known yet" case to handle.
+        const info = applyClientSnapshot(client);
+        if (!info) return;
+        clearRoomDeletionTimer(room);
+        roomInfo.sockets.add(info.socket);
+        return;
+      }
+      // A *departure*, on the other hand, must never materialize anything:
+      // this event can be published by a worker that doesn't own the client
+      // (see detachSession), so applying the snapshot could resurrect a
+      // connection whose owner has already announced it as gone.
+      const info = clientsByConnKey.get(client.connKey);
+      if (info) roomInfo.sockets.delete(info.socket);
+    }
+  );
+
+  onBus(
+    "room:name",
+    ({ room, key, client }: { room: string; key: string; client: ClientSnapshot | null }) => {
+      const roomInfo = rooms.get(room);
+      if (!roomInfo) return;
+      if (!client) {
+        roomInfo.names.delete(key);
+        return;
+      }
+      const info = applyClientSnapshot(client);
+      if (info) roomInfo.names.set(key, info.socket);
+    }
+  );
+
+  onBus(
+    "signal:queue",
+    ({ targetId, from, data }: { targetId: string; from: string; data: unknown }) => {
+      queueSignal(targetId, from, data);
+    }
+  );
+
+  onBus("signal:flush", ({ targetId }: { targetId: string }) => {
+    pendingSignals.delete(targetId);
+  });
+
+  onBus("turnstile:verified", ({ ip, at }: { ip: string; at: number }) => {
+    turnstileVerifiedIps.set(ip, at);
+  });
+
+  // A worker died (crash, OOM, a deploy killing one). Every surviving worker
+  // still holds replicas of the connections it owned, and those connections
+  // are gone — but exactly one worker has to run the real departure
+  // (crediting call time, handing over room ownership, telling the room
+  // someone left). The primary names that worker; the others just drop their
+  // replicas and let its events do the rest.
+  onBus("worker:gone", ({ workerId, cleanupBy }: { workerId: number; cleanupBy: number }) => {
+    const victims = [...clients.values()].filter((c) => c.worker === workerId);
+    if (cleanupBy !== WORKER_ID) {
+      for (const info of victims) applyClientRemoval(info.connKey);
+      return;
+    }
+    for (const info of victims) {
+      // Mirrors the real socket "close" handler below — what would have run
+      // had the process lived long enough to see the disconnect.
+      if (info.room) leaveRoom(info);
+      if (clientsById.get(info.id) === info) {
+        clientsById.delete(info.id);
+        pendingSignals.delete(info.id);
+        clusterEvent("signal:flush", { targetId: info.id });
+      }
+      clients.delete(info.socket);
+      clientsByConnKey.delete(info.connKey);
+      publishClientRemoval(info);
+    }
+  });
+}
+
+// The site-wide state above (the announcement banner and its live counters,
+// the partner ads and theirs, the supporters list) is edited through HTTP
+// admin routes, and an HTTP request only ever reaches one worker. Without
+// these, an admin publishing a banner would have it appear for a quarter of
+// the site and GET /admin/announcement would report whichever worker's
+// counters the request happened to land on.
+//
+// The *broadcasts* those routes make need no replication at all — a worker's
+// broadcastToAll already walks every socket in the cluster (remote ones
+// included, see RemoteSocket), so the banner reaches everyone from wherever
+// it was published. What travels here is only the server-side state a later
+// request or a later connection reads back.
+if (CLUSTER_ENABLED) {
+  onBus(
+    "announcement:set",
+    ({ announcement, resetStats }: { announcement: Announcement | null; resetStats: boolean }) => {
+      currentAnnouncement = announcement;
+      // POST (a brand new announcement) and DELETE reset the counters; PUT
+      // deliberately keeps them, since editing one is not a new campaign —
+      // see AnnouncementStatsEntry.
+      if (resetStats) {
+        announcementStats = announcement
+          ? { viewerIds: new Set(), buttonClicks: 0, xClicks: 0 }
+          : null;
+      }
+    }
+  );
+
+  onBus(
+    "announcement:stat",
+    ({ id, kind, clientId }: { id: string; kind: "view" | "button" | "x"; clientId: string }) => {
+      if (!currentAnnouncement || !announcementStats || id !== currentAnnouncement.id) return;
+      if (kind === "view") announcementStats.viewerIds.add(clientId);
+      else if (kind === "button") announcementStats.buttonClicks += 1;
+      else announcementStats.xClicks += 1;
+    }
+  );
+
+  onBus("partner:config", ({ config }: { config: PartnerConfig }) => {
+    partnerConfig = config;
+  });
+
+  onBus("partner:stat-reset", ({ id }: { id: string }) => {
+    partnerStats.delete(id);
+  });
+
+  onBus(
+    "partner:stat",
+    ({
+      id,
+      field,
+      viewerId,
+    }: {
+      id: string;
+      field: "views" | "sessionViews" | "clicks" | "clicksByVideo" | "rewardVideoOpens" | "rewardVideoCompletions";
+      viewerId?: string;
+    }) => {
+      const entry = getPartnerStats(id);
+      // Only "partner-session-view" sends a viewerId, and the worker that
+      // handled it already checked the connection wasn't counted before —
+      // this is the same dedupe applied to the replica, so the sets stay
+      // identical and a later reconnect onto another worker is still deduped.
+      if (viewerId) {
+        if (entry.viewerIds.has(viewerId)) return;
+        entry.viewerIds.add(viewerId);
+      }
+      entry[field] += 1;
+    }
+  );
+
+  onBus("supporters:set", ({ supporters }: { supporters: Supporter[] }) => {
+    currentSupporters = supporters;
+  });
+}
+
+// A worker that starts *after* the others — the one the primary forks to
+// replace a crashed process — comes up with an empty replica. Left that way
+// it would be a stranger in its own cluster: the first person routed to it
+// who joined an ongoing room would find no such room, create a second one
+// from the persisted record, and sit alone in it while everybody else
+// carried on in the original. Replication only carries *changes*, so
+// nothing would ever fix that on its own.
+//
+// So a starting worker asks for the current state and waits (briefly) for
+// it before it starts accepting connections. Every other worker answers
+// with everything it knows — they all hold the same full replica, so one
+// answer is enough and the rest are harmless repeats. On the cluster's very
+// first boot there is nobody to answer and this just times out, which costs
+// one short pause on a process that is starting anyway.
+interface ClusterStateDump {
+  clients: ClientSnapshot[];
+  rooms: {
+    room: string;
+    record: RoomRecord;
+    createdAt: number;
+    messages: ChatMessage[];
+    videoSources: RoomVideoSource[];
+    // connKeys rather than snapshots: every client involved is already in
+    // `clients` above, which is applied first.
+    members: string[];
+    names: [string, string][];
+  }[];
+  pendingSignals: [string, PendingSignal[]][];
+  turnstile: [string, number][];
+  announcement: Announcement | null;
+  announcementStats: { viewerIds: string[]; buttonClicks: number; xClicks: number } | null;
+  partnerConfig: PartnerConfig;
+  partnerStats: [string, { viewerIds: string[]; counts: Omit<PartnerStatsEntry, "viewerIds"> }][];
+  supporters: Supporter[];
+}
+
+function buildClusterStateDump(): ClusterStateDump {
+  return {
+    clients: [...clients.values()].map(clientSnapshot),
+    rooms: [...rooms.entries()].map(([room, roomInfo]) => ({
+      room,
+      record: roomRecordOf(roomInfo),
+      createdAt: roomInfo.createdAt,
+      messages: roomInfo.messages,
+      videoSources: roomInfo.videoSources,
+      members: [...roomInfo.sockets]
+        .map((s) => clients.get(s)?.connKey)
+        .filter((k): k is string => k !== undefined),
+      names: [...roomInfo.names.entries()]
+        .map(([key, s]) => [key, clients.get(s)?.connKey] as [string, string | undefined])
+        .filter((entry): entry is [string, string] => entry[1] !== undefined),
+    })),
+    pendingSignals: [...pendingSignals.entries()],
+    turnstile: [...turnstileVerifiedIps.entries()],
+    announcement: currentAnnouncement,
+    announcementStats: announcementStats
+      ? {
+          viewerIds: [...announcementStats.viewerIds],
+          buttonClicks: announcementStats.buttonClicks,
+          xClicks: announcementStats.xClicks,
+        }
+      : null,
+    partnerConfig,
+    partnerStats: [...partnerStats.entries()].map(([id, entry]) => [
+      id,
+      {
+        viewerIds: [...entry.viewerIds],
+        counts: {
+          views: entry.views,
+          sessionViews: entry.sessionViews,
+          clicks: entry.clicks,
+          clicksByVideo: entry.clicksByVideo,
+          rewardVideoOpens: entry.rewardVideoOpens,
+          rewardVideoCompletions: entry.rewardVideoCompletions,
+        },
+      },
+    ]),
+    supporters: currentSupporters,
+  };
+}
+
+// Deliberately additive: rooms are only created when missing and members are
+// only added, never removed. A live event that landed while the dump was in
+// flight describes a *newer* truth than the dump does, and must not be
+// undone by it.
+function applyClusterStateDump(dump: ClusterStateDump): void {
+  for (const snap of dump.clients) applyClientSnapshot(snap);
+  for (const entry of dump.rooms) {
+    let roomInfo = rooms.get(entry.room);
+    if (!roomInfo) {
+      roomInfo = {
+        sockets: new Set(),
+        createdAt: entry.createdAt,
+        messages: entry.messages,
+        names: new Map(),
+        videoSources: entry.videoSources,
+        ...entry.record,
+      };
+      rooms.set(entry.room, roomInfo);
+    }
+    for (const connKey of entry.members) {
+      const info = clientsByConnKey.get(connKey);
+      if (info) roomInfo.sockets.add(info.socket);
+    }
+    for (const [key, connKey] of entry.names) {
+      const info = clientsByConnKey.get(connKey);
+      if (info && !roomInfo.names.has(key)) roomInfo.names.set(key, info.socket);
+    }
+  }
+  for (const [targetId, queue] of dump.pendingSignals) {
+    if (!pendingSignals.has(targetId)) pendingSignals.set(targetId, queue);
+  }
+  for (const [ip, at] of dump.turnstile) {
+    if (!turnstileVerifiedIps.has(ip)) turnstileVerifiedIps.set(ip, at);
+  }
+  currentAnnouncement = dump.announcement;
+  announcementStats = dump.announcementStats
+    ? {
+        viewerIds: new Set(dump.announcementStats.viewerIds),
+        buttonClicks: dump.announcementStats.buttonClicks,
+        xClicks: dump.announcementStats.xClicks,
+      }
+    : null;
+  partnerConfig = dump.partnerConfig;
+  for (const [id, entry] of dump.partnerStats) {
+    const target = getPartnerStats(id);
+    for (const viewerId of entry.viewerIds) target.viewerIds.add(viewerId);
+    Object.assign(target, entry.counts);
+  }
+  currentSupporters = dump.supporters;
+}
+
+// How long a starting worker waits for an answer before giving up and
+// serving anyway. Long enough for an IPC round trip several times over,
+// short enough that it is not a meaningful part of a restart.
+const STATE_HYDRATION_TIMEOUT_MS = 750;
+let hydrated = false;
+
+if (CLUSTER_ENABLED) {
+  onBus("state:request", (_payload: unknown, from: number) => {
+    busSendTo(from, "state:dump", buildClusterStateDump());
+  });
+}
+
+async function hydrateFromCluster(): Promise<void> {
+  if (!CLUSTER_ENABLED) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, STATE_HYDRATION_TIMEOUT_MS);
+    onBus("state:dump", (dump: ClusterStateDump) => {
+      // Later dumps (the other workers answering the same request, or a
+      // future one) are still applied — they are additive — but only the
+      // first one has to be waited for.
+      applyClusterStateDump(dump);
+      if (hydrated) return;
+      hydrated = true;
+      clearTimeout(timer);
+      resolve();
+    });
+    busPublish("state:request", {});
+  });
+}
+
 registerStatsProvider(() => {
   const registeredPeers = [...clients.values()].filter((c) => c.name !== null && !c.isModerator);
   const identities = { accounts: 0, guestsWithToken: 0, guestsWithoutToken: 0 };
@@ -1114,7 +1820,20 @@ registerStatsProvider(() => {
   // point of recomputing this fresh on every scrape instead of tracking it
   // incrementally).
   const locationCounts = new Map<string, LocationStats>();
+  // Which worker is actually terminating each socket (see ClientInfo.worker).
+  // Every worker holds the entire cluster's connections, so any one of them
+  // can report the whole split — which is why the gauges built from this are
+  // aggregated with "first" instead of summed. Counted in this same pass
+  // rather than its own, since it needs exactly the same walk.
+  const workerCounts = new Map<number, WorkerStats>();
   for (const c of clients.values()) {
+    let workerEntry = workerCounts.get(c.worker);
+    if (!workerEntry) {
+      workerEntry = { id: c.worker, sockets: 0, registeredPeers: 0 };
+      workerCounts.set(c.worker, workerEntry);
+    }
+    workerEntry.sockets += 1;
+    if (c.name !== null && !c.isModerator) workerEntry.registeredPeers += 1;
     if (!c.geoLocation) continue;
     const key = `${c.geoLocation.country}|${c.geoLocation.lat}|${c.geoLocation.lon}`;
     const entry = locationCounts.get(key);
@@ -1133,6 +1852,7 @@ registerStatsProvider(() => {
       isPrivate: isPrivateRoom(handle),
     })),
     locations: [...locationCounts.values()],
+    workers: [...workerCounts.values()].sort((a, b) => a.id - b.id),
   };
 });
 
@@ -1469,12 +2189,17 @@ function deliverOrQueueSignal(room: string, targetId: string, from: string, data
     return;
   }
   queueSignal(targetId, from, data);
+  // The target can reconnect onto any worker, and only the worker holding the
+  // queue can flush it — so every worker keeps a copy and whichever one ends
+  // up with that peer clears it from the rest (see flushPendingSignals).
+  clusterEvent("signal:queue", { targetId, from, data });
 }
 
 function flushPendingSignals(info: ClientInfo) {
   const queue = pendingSignals.get(info.id);
   if (!queue) return;
   pendingSignals.delete(info.id);
+  clusterEvent("signal:flush", { targetId: info.id });
   const now = Date.now();
   for (const item of queue) {
     if (now - item.queuedAt > PENDING_SIGNAL_TTL_MS) continue;
@@ -1577,6 +2302,7 @@ function scheduleRoomDeletion(room: string) {
       const roomInfo = rooms.get(room);
       if (roomInfo && roomInfo.sockets.size === 0) {
         rooms.delete(room);
+        publishRoomRemoved(room);
         deletePersistedChat(room).catch((err) => {
           console.error(`[room-deletion] Falha ao apagar chat persistido de "${room}":`, err);
         });
@@ -1632,8 +2358,10 @@ function leaveRoom(info: ClientInfo) {
   const roomInfo = rooms.get(room);
   if (roomInfo) {
     roomInfo.sockets.delete(info.socket);
+    publishRoomMember(room, info, false);
     if (info.name && roomInfo.names.get(info.name.toLowerCase()) === info.socket) {
       roomInfo.names.delete(info.name.toLowerCase());
+      publishRoomName(room, info.name.toLowerCase(), null);
     }
     if (roomInfo.sockets.size === 0) {
       // The room *looks* empty, but don't wipe its chat history yet — see
@@ -1671,6 +2399,7 @@ function leaveRoom(info: ClientInfo) {
         // otherwise offer to "demote" the person who runs the room.
         roomInfo.admins = roomInfo.admins.filter((a) => a.id !== roomInfo.ownerId);
         persistRoomRecord(room, roomInfo);
+        publishRoomRecord(room, roomInfo);
         broadcastToRoom(room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
       }
     }
@@ -1689,6 +2418,7 @@ function leaveRoom(info: ClientInfo) {
       const orphaned = roomInfo.videoSources.filter((v) => v.addedById === leaverId);
       if (orphaned.length > 0) {
         roomInfo.videoSources = roomInfo.videoSources.filter((v) => v.addedById !== leaverId);
+        publishRoomVideoSources(room, roomInfo);
         for (const source of orphaned) {
           broadcastToRoom(room, { type: "video-source-removed", id: source.id });
         }
@@ -1718,32 +2448,91 @@ const SUPERSEDED_CLOSE_CODE = 4000;
 // Removes the stale session from every bookkeeping structure and closes it
 // *without* broadcasting peer-left, since this identity is carried over
 // seamlessly to the new socket rather than actually leaving the room.
+// Gives up the room slot a superseded session was holding, and decides right
+// there whether the room just emptied out.
+//
+// Split out of detachSession below because that decision has to be made
+// exactly once, by the worker that is *handling the reclaim* — synchronously,
+// before that same handler goes on to re-join the room under the new socket.
+// Leaving it to the worker that happens to own the old connection would let
+// "the room is empty now" be decided from a replica that has not yet heard
+// about the new socket joining, and delete a room somebody is sitting in.
+function releaseRoomSlot(info: ClientInfo) {
+  if (!info.room) return;
+  const room = info.room;
+  const roomInfo = rooms.get(room);
+  if (roomInfo) {
+    roomInfo.sockets.delete(info.socket);
+    publishRoomMember(room, info, false);
+    if (info.name && roomInfo.names.get(info.name.toLowerCase()) === info.socket) {
+      roomInfo.names.delete(info.name.toLowerCase());
+      publishRoomName(room, info.name.toLowerCase(), null);
+    }
+    // Deliberately leaves the persisted chat file alone even if this was
+    // the room's last socket: the new connection taking over this
+    // identity is about to "join" the same room again, and will reload
+    // this exact history from disk when it recreates the RoomInfo.
+    if (roomInfo.sockets.size === 0) {
+      rooms.delete(room);
+      publishRoomRemoved(room);
+    }
+  }
+  info.room = null;
+}
+
 function detachSession(info: ClientInfo) {
+  // The session being reclaimed may belong to another worker (a reload whose
+  // new socket landed somewhere else). The room side is settled here either
+  // way — see releaseRoomSlot — and only the connection side is handed over,
+  // because clearing info.room where the real socket lives is what stops that
+  // socket's imminent close event from broadcasting a "peer-left" for an
+  // identity that is being carried over rather than leaving.
+  if (!isLocalClient(info)) {
+    releaseRoomSlot(info);
+    if (clientsById.get(info.id) === info) clientsById.delete(info.id);
+    clients.delete(info.socket);
+    clientsByConnKey.delete(info.connKey);
+    busSendTo(info.worker, "client:detach", { connKey: info.connKey });
+    return;
+  }
   // A reconnect still ends this connection's open call/mic/share segments —
   // the new socket that reclaims this identity starts fresh ones of its own
   // in "join" below, rather than this old ClientInfo (about to be discarded)
   // silently losing whatever it had accumulated.
   flushClientStats(info);
+  releaseRoomSlot(info);
+  if (clientsById.get(info.id) === info) clientsById.delete(info.id);
+  clients.delete(info.socket);
+  clientsByConnKey.delete(info.connKey);
+  publishClientRemoval(info);
+  // A graceful close (not terminate()) so the close frame with our code
+  // actually reaches the displaced client instead of the connection just
+  // dying silently.
+  info.socket.close(SUPERSEDED_CLOSE_CODE, "superseded-by-new-connection");
+}
+
+// The owning worker's half of a reclaim handled on another worker (see
+// detachSession). Everything about the *room* was already decided and
+// published over there; all that is left here is this connection's own
+// bookkeeping — crediting its open call/mic/share segments, clearing
+// info.room so the close below isn't mistaken for a departure, and closing
+// the displaced socket with the code that tells its client it was superseded
+// rather than dropped.
+function detachSessionOnOwner(info: ClientInfo) {
+  flushClientStats(info);
   if (info.room) {
     const roomInfo = rooms.get(info.room);
     if (roomInfo) {
       roomInfo.sockets.delete(info.socket);
-      if (info.name && roomInfo.names.get(info.name.toLowerCase()) === info.socket) {
-        roomInfo.names.delete(info.name.toLowerCase());
-      }
-      // Deliberately leaves the persisted chat file alone even if this was
-      // the room's last socket: the new connection taking over this
-      // identity is about to "join" the same room again, and will reload
-      // this exact history from disk when it recreates the RoomInfo.
-      if (roomInfo.sockets.size === 0) rooms.delete(info.room);
+      const nameKey = info.name ? info.name.toLowerCase() : null;
+      if (nameKey && roomInfo.names.get(nameKey) === info.socket) roomInfo.names.delete(nameKey);
     }
     info.room = null;
   }
   if (clientsById.get(info.id) === info) clientsById.delete(info.id);
   clients.delete(info.socket);
-  // A graceful close (not terminate()) so the close frame with our code
-  // actually reaches the displaced client instead of the connection just
-  // dying silently.
+  clientsByConnKey.delete(info.connKey);
+  publishClientRemoval(info);
   info.socket.close(SUPERSEDED_CLOSE_CODE, "superseded-by-new-connection");
 }
 
@@ -1850,7 +2639,22 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       if (fresh.length === 0) pendingSignals.delete(targetId);
       else if (fresh.length !== queue.length) pendingSignals.set(targetId, fresh);
     }
+    // Only when clustered: a room is normally torn down by the worker whose
+    // last member left (see scheduleRoomDeletion), and if that worker dies
+    // before its timer fires, nobody else has one — the emptied room would
+    // sit in every replica forever. Costs a walk of a map that is almost
+    // always all-populated rooms, and the same grace period still applies.
+    if (CLUSTER_ENABLED) {
+      for (const [handle, roomInfo] of rooms) {
+        if (roomInfo.sockets.size === 0 && !roomDeletionTimers.has(handle)) {
+          scheduleRoomDeletion(handle);
+        }
+      }
+    }
     for (const info of clients.values()) {
+      // Replicas of other workers' connections are pinged and reaped by the
+      // worker that actually holds the socket — see RemoteSocket.
+      if (!isLocalClient(info)) continue;
       try {
         if (!info.isAlive) {
           heartbeatReapedTotal.inc();
@@ -2164,6 +2968,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     // doc comment for why PUT (edit) instead preserves this bucket.
     announcementStats = { viewerIds: new Set(), buttonClicks: 0, xClicks: 0 };
     await savePersistedAnnouncement(currentAnnouncement);
+    clusterEvent("announcement:set", { announcement: currentAnnouncement, resetStats: true });
     broadcastToAll({ type: "announcement", announcement: currentAnnouncement, live: true });
     return { announcement: currentAnnouncement, stats: announcementStatsSummary() };
   });
@@ -2191,6 +2996,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
 
     currentAnnouncement = { ...currentAnnouncement, ...parsed, version: currentAnnouncement.version + 1 };
     await savePersistedAnnouncement(currentAnnouncement);
+    clusterEvent("announcement:set", { announcement: currentAnnouncement, resetStats: false });
     broadcastToAll({ type: "announcement", announcement: currentAnnouncement, live: true });
     return { announcement: currentAnnouncement, stats: announcementStatsSummary() };
   });
@@ -2202,6 +3008,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     currentAnnouncement = null;
     announcementStats = null;
     await deletePersistedAnnouncement();
+    clusterEvent("announcement:set", { announcement: null, resetStats: true });
     broadcastToAll({ type: "announcement", announcement: null, live: true });
     return reply.code(204).send();
   });
@@ -2284,6 +3091,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     }
     currentSupporters = sortSupporters(parsed.slice(0, MAX_SUPPORTERS));
     await savePersistedSupporters(currentSupporters);
+    clusterEvent("supporters:set", { supporters: currentSupporters });
     broadcastToAll({ type: "supporters", supporters: currentSupporters });
     return { supporters: currentSupporters };
   });
@@ -2455,6 +3263,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     const partner: Partner = { id: genId(), createdAt: Date.now(), ...parsed };
     partnerConfig = { ...partnerConfig, partners: [...partnerConfig.partners, partner] };
     await savePersistedPartnerConfig(partnerConfig);
+    clusterEvent("partner:config", { config: partnerConfig });
     broadcastPartnerUpdate();
     return { partner, stats: (await partnerStatsSummaries([partner.id]))[partner.id] };
   });
@@ -2479,6 +3288,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       partners: partnerConfig.partners.map((p) => (p.id === id ? updated : p)),
     };
     await savePersistedPartnerConfig(partnerConfig);
+    clusterEvent("partner:config", { config: partnerConfig });
     broadcastPartnerUpdate();
     return { partner: updated, stats: (await partnerStatsSummaries([id]))[id] };
   });
@@ -2490,6 +3300,8 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     const { id } = request.params as { id: string };
     partnerConfig = { ...partnerConfig, partners: partnerConfig.partners.filter((p) => p.id !== id) };
     partnerStats.delete(id);
+    clusterEvent("partner:config", { config: partnerConfig });
+    clusterEvent("partner:stat-reset", { id });
     await deletePersistedPartnerStats(id);
     await deletePersistedPartnerRewardClaims(id);
     await savePersistedPartnerConfig(partnerConfig);
@@ -2516,6 +3328,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       }
       partnerConfig = { ...partnerConfig, emptyPercent: rawPercent };
       await savePersistedPartnerConfig(partnerConfig);
+      clusterEvent("partner:config", { config: partnerConfig });
       return { emptyPercent: partnerConfig.emptyPercent };
     }
   );
@@ -2714,9 +3527,13 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       geoLocation: lookupConnectionLocation(ip),
       userAgent,
       platform: classifyClientPlatform(userAgent, null),
+      worker: WORKER_ID,
+      connKey: genId(),
       rateLimitKey: genId(),
     };
     clients.set(socket, info);
+    clientsByConnKey.set(info.connKey, info);
+    syncClient(info);
     wsConnectionsTotal.inc();
     send(socket, { type: "welcome", id: info.id });
     // "online-only" is deliberately never handed to a connection that shows
@@ -2747,6 +3564,12 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       // would otherwise process at unlimited rate).
       if (!(await consumeRateLimit(wsGlobalLimiter, info.rateLimitKey, "global"))) return;
 
+      // Wrapped so that whatever the handler below changed about this
+      // connection reaches the rest of the cluster exactly once, on the way
+      // out — every `return` inside the switch returns from here, not from
+      // the listener, so there is no exit path that skips it. syncClient is a
+      // no-op when this process is the whole server.
+      const handleMessage = async (): Promise<void> => {
       switch (msg.type) {
         case "register": {
           // Covers both the initial registration and every later rename
@@ -2913,8 +3736,12 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (info.room) {
             const roomInfo = rooms.get(info.room);
             if (roomInfo) {
-              if (previousName) roomInfo.names.delete(previousName.toLowerCase());
+              if (previousName) {
+                roomInfo.names.delete(previousName.toLowerCase());
+                publishRoomName(info.room, previousName.toLowerCase(), null);
+              }
               roomInfo.names.set(key, socket);
+              publishRoomName(info.room, key, info);
             }
           }
 
@@ -3160,6 +3987,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
                 ...record,
               };
               rooms.set(room, roomInfo);
+              publishRoomCreated(room, roomInfo);
               roomsCreatedTotal.inc({ visibility: isPrivateRoom(room) ? "private" : "public" });
               if (!existingRecord) void saveRoomRecord(room, record);
             }
@@ -3171,6 +3999,8 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (info.room !== room || !clients.has(socket)) return;
           roomInfo.sockets.add(socket);
           roomInfo.names.set(nameKey, socket);
+          publishRoomMember(room, info, true);
+          publishRoomName(room, nameKey, info);
           const peers = [...roomInfo.sockets]
             .filter((s) => s !== socket)
             .map((s) => clients.get(s))
@@ -3250,6 +4080,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           info.sharingCamera = undefined;
           info.mic = false;
           roomInfo.sockets.add(socket);
+          publishRoomMember(room, info, true);
           const adminPeers = [...roomInfo.sockets]
             .filter((s) => s !== socket)
             .map((s) => clients.get(s))
@@ -3421,6 +4252,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (!changed) return;
           roomInfo.permissions = requested;
           persistRoomRecord(info.room, roomInfo);
+          publishRoomRecord(info.room, roomInfo);
           broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
           break;
         }
@@ -3456,6 +4288,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           const admin: RoomAdmin = { id: userId, name: target.name };
           roomInfo.admins = [...roomInfo.admins, admin];
           persistRoomRecord(info.room, roomInfo);
+          publishRoomRecord(info.room, roomInfo);
           broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
           break;
         }
@@ -3469,6 +4302,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (!userId || !roomInfo.admins.some((a) => a.id === userId)) return;
           roomInfo.admins = roomInfo.admins.filter((a) => a.id !== userId);
           persistRoomRecord(info.room, roomInfo);
+          publishRoomRecord(info.room, roomInfo);
           broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
           break;
         }
@@ -3502,6 +4336,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (next?.lat === current?.lat && next?.lng === current?.lng) return;
           roomInfo.location = next;
           persistRoomRecord(info.room, roomInfo);
+          publishRoomRecord(info.room, roomInfo);
           broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
           break;
         }
@@ -3528,6 +4363,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           roomInfo.description = nextDescription;
           roomInfo.category = nextCategory;
           persistRoomRecord(info.room, roomInfo);
+          publishRoomRecord(info.room, roomInfo);
           broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
           break;
         }
@@ -3602,6 +4438,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             updatedAt: Date.now(),
           };
           roomInfo.videoSources.push(source);
+          publishRoomVideoSources(info.room, roomInfo);
           broadcastToRoom(info.room, { type: "video-source-added", source });
           break;
         }
@@ -3620,6 +4457,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           const target = roomInfo.videoSources.find((v) => v.id === id);
           if (!target || target.addedById !== stableUserId(info)) return;
           roomInfo.videoSources = roomInfo.videoSources.filter((v) => v.id !== id);
+          publishRoomVideoSources(info.room, roomInfo);
           broadcastToRoom(info.room, { type: "video-source-removed", id });
           break;
         }
@@ -3667,6 +4505,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             }
           }
           source.updatedAt = Date.now();
+          publishRoomVideoSources(info.room, roomInfo);
           broadcastToRoom(info.room, {
             type: "video-source-state",
             id: source.id,
@@ -3784,6 +4623,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             roomInfo.messages.splice(0, roomInfo.messages.length - ROOM_CHAT_HISTORY_LIMIT);
           }
           savePersistedChat(info.room, roomInfo.messages);
+          publishRoomChat(info.room, chatMessage);
           broadcastToRoom(info.room, { type: "chat-message", ...chatMessage });
           break;
         }
@@ -3817,6 +4657,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (!currentAnnouncement || !announcementStats || id !== currentAnnouncement.id) return;
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "announcement-view"))) return;
           announcementStats.viewerIds.add(info.id);
+          clusterEvent("announcement:stat", { id, kind: "view", clientId: info.id });
           break;
         }
         case "announcement-button-click": {
@@ -3824,6 +4665,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (!currentAnnouncement || !announcementStats || id !== currentAnnouncement.id) return;
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "announcement-click"))) return;
           announcementStats.buttonClicks += 1;
+          clusterEvent("announcement:stat", { id, kind: "button", clientId: info.id });
           break;
         }
         case "announcement-x-click": {
@@ -3831,6 +4673,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (!currentAnnouncement || !announcementStats || id !== currentAnnouncement.id) return;
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "announcement-x-click"))) return;
           announcementStats.xClicks += 1;
+          clusterEvent("announcement:stat", { id, kind: "x", clientId: info.id });
           break;
         }
         // Same reasoning as the announcement-* cases above, for the sidebar
@@ -3849,6 +4692,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (!partnerConfig.partners.some((p) => p.id === id)) return;
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "partner-view"))) return;
           getPartnerStats(id).views += 1;
+          clusterEvent("partner:stat", { id, field: "views" });
           // Not awaited: it only writes through to Redis/disk (and logs its
           // own failures), and nothing in this handler's reply depends on
           // it — no reason to hold up the socket for the roundtrip.
@@ -3875,6 +4719,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (entry.viewerIds.has(info.id)) break;
           entry.viewerIds.add(info.id);
           entry.sessionViews += 1;
+          clusterEvent("partner:stat", { id, field: "sessionViews", viewerId: info.id });
           void incrementPersistedPartnerStats(id, { sessionViews: 1 });
           break;
         }
@@ -3890,9 +4735,11 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           const fromVideo = msg.source === "video";
           if (fromVideo) {
             getPartnerStats(id).clicksByVideo += 1;
+            clusterEvent("partner:stat", { id, field: "clicksByVideo" });
             void incrementPersistedPartnerStats(id, { clicksByVideo: 1 });
           } else {
             getPartnerStats(id).clicks += 1;
+            clusterEvent("partner:stat", { id, field: "clicks" });
             void incrementPersistedPartnerStats(id, { clicks: 1 });
           }
           break;
@@ -3911,6 +4758,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             return;
           }
           getPartnerStats(id).rewardVideoOpens += 1;
+          clusterEvent("partner:stat", { id, field: "rewardVideoOpens" });
           void incrementPersistedPartnerStats(id, { rewardVideoOpens: 1 });
           break;
         }
@@ -3931,12 +4779,17 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             return;
           }
           getPartnerStats(id).rewardVideoCompletions += 1;
+          clusterEvent("partner:stat", { id, field: "rewardVideoCompletions" });
           void incrementPersistedPartnerStats(id, { rewardVideoCompletions: 1 });
           break;
         }
         default:
           break;
       }
+      };
+
+      await handleMessage();
+      syncClient(info);
     });
 
     socket.on("close", () => {
@@ -3949,8 +4802,17 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       if (clientsById.get(info.id) === info) {
         clientsById.delete(info.id);
         pendingSignals.delete(info.id);
+        clusterEvent("signal:flush", { targetId: info.id });
       }
       clients.delete(socket);
+      clientsByConnKey.delete(info.connKey);
+      publishClientRemoval(info);
     });
   });
+
+  // Last thing before this worker starts accepting connections: pull the
+  // state it was born too late to have seen. See hydrateFromCluster — a no-op
+  // unless clustered, and a short timeout on the cluster's first boot when
+  // there is nobody to answer yet.
+  await hydrateFromCluster();
 }

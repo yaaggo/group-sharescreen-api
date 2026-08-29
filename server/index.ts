@@ -21,6 +21,9 @@ import { register as metricsRegister, httpRateLimitedTotal } from "./metrics.js"
 import { initModerationStore } from "./moderationStore.js";
 import { initAccountStore } from "./accountStore.js";
 import { registerOAuthRoutes } from "./oauthRoutes.js";
+import { CLUSTER_ENABLED, WORKER_ID, busRequest } from "./clusterBus.js";
+import { clusterHealth, refreshClusterRoster } from "./clusterInfo.js";
+import { ClusterRateLimitStore } from "./httpRateLimitStore.js";
 
 const PORT = Number(process.env.PORT || 4000);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -31,7 +34,12 @@ const HOST = process.env.HOST || "0.0.0.0";
 // shouldn't be world-readable on an unauthenticated endpoint.
 const METRICS_TOKEN = process.env.METRICS_TOKEN || null;
 
-const CURRENT_ID = randomUUID()
+// Shared across the whole cluster when there is one (see clusterPrimary.ts,
+// which mints it once and passes it to every worker it forks): GET /health
+// hands this back, and a value that differed per worker would turn a
+// perfectly healthy cluster into an endpoint that reports a "new" server on
+// every other poll.
+const CURRENT_ID = process.env.SS_CURRENT_ID || randomUUID();
 
 process.on("uncaughtException", (err) => {
   console.error("[fatal] uncaughtException:", err);
@@ -88,6 +96,11 @@ async function main() {
   await app.register(rateLimit, {
     max: 100,
     timeWindow: "1 minute",
+    // Only when clustered: the plugin's own store counts per process, so N
+    // workers would quietly turn every limit below (and every per-route one
+    // in signaling.ts) into N times what it says. See httpRateLimitStore.ts
+    // — it keeps the same fixed-window arithmetic and shares the counts.
+    ...(CLUSTER_ENABLED ? { store: ClusterRateLimitStore as never } : {}),
     onExceeded: (request) => {
       httpRateLimitedTotal.inc({ route: request.routeOptions?.url ?? request.url });
     },
@@ -98,7 +111,18 @@ async function main() {
   // IPs — rate limiting this would risk the check itself flapping the
   // service as unhealthy, which is worse than any abuse this endpoint could
   // realistically absorb (it does nothing but echo a constant).
-  app.get("/health", { config: { rateLimit: false } }, async () => ({ ok: true, CURRENT_ID }));
+  // `ok` and `CURRENT_ID` are unchanged and still the whole answer for an
+  // uptime monitor. `cluster` is additive: which worker took this particular
+  // request, how many are up against how many were asked for, how many have
+  // been replaced since the primary started, and each one's pid and uptime.
+  // Answered from the roster the primary pushes out (see clusterInfo.ts), so
+  // it stays a memory read with no IPC round trip — this endpoint is
+  // deliberately exempt from rate limiting and gets polled hard.
+  app.get("/health", { config: { rateLimit: false } }, async () => ({
+    ok: true,
+    CURRENT_ID,
+    cluster: clusterHealth(),
+  }));
 
   app.get(
     "/metrics",
@@ -118,6 +142,25 @@ async function main() {
         }
       }
       reply.header("Content-Type", metricsRegister.contentType);
+      // A scrape reaches whichever worker the OS handed the connection to,
+      // so answering with just that worker's registry would report a
+      // different slice of the process pool on every scrape — counters
+      // sawing up and down, default metrics (CPU, heap) describing one
+      // arbitrary process. The primary is the only one that can talk to all
+      // the workers, so it collects and merges them (see clusterPrimary.ts).
+      // The room/connection gauges are already cluster-wide on every worker
+      // thanks to the replication in signaling.ts, which is why they're
+      // aggregated with "first" rather than summed — see metrics.ts.
+      if (CLUSTER_ENABLED) {
+        try {
+          return await busRequest<string>("metrics:collect");
+        } catch (err) {
+          // Falling back to this worker's own numbers beats answering a
+          // scrape with an error: partial metrics still graph, a 500 leaves
+          // a hole and fires whatever alerts watch for one.
+          app.log.error(err, "metrics: falha ao agregar o cluster");
+        }
+      }
       return metricsRegister.metrics();
     }
   );
@@ -134,6 +177,13 @@ async function main() {
 
   try {
     await app.listen({ port: PORT, host: HOST });
+    if (CLUSTER_ENABLED) {
+      console.log(`[cluster] Worker ${WORKER_ID} (pid ${process.pid}) ouvindo em ${HOST}:${PORT}.`);
+      // The primary broadcasts the roster the moment this worker starts
+      // listening, so this only covers having missed that one. Not awaited:
+      // nothing here should hold up a server that is already serving.
+      void refreshClusterRoster();
+    }
   } catch (err) {
     app.log.error(err);
     process.exit(1);

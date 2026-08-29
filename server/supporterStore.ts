@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { createClient } from "redis";
+import { getRedis } from "./redisClient.js";
 
 export interface Supporter {
   name: string;
@@ -41,27 +41,9 @@ function saveToDisk(supporters: Supporter[]) {
   }
 }
 
-// See chatStore.ts's identical `RedisClient` alias for why this is `any`
-// rather than a precise type.
-type RedisClient = any; // eslint-disable-line @typescript-eslint/no-explicit-any
-
-let redisReady: Promise<RedisClient> | null = null;
-
-async function getRedis(): Promise<RedisClient> {
-  if (redisReady) return redisReady;
-  const client = createClient({ url: REDIS_URL });
-  client.on("error", (err: Error) => {
-    console.error("[supporterStore] Erro na conexão com o Redis:", err.message);
-  });
-  const connecting = client.connect().then(() => client);
-  redisReady = connecting;
-  try {
-    return await connecting;
-  } catch (err) {
-    redisReady = null;
-    throw err;
-  }
-}
+// The Redis connection is shared by every store in this process — see
+// redisClient.ts, which also wires REDIS_CA_CERT for a `rediss://` endpoint
+// whose certificate comes from a private CA.
 
 const REDIS_KEY = "sharescreen:supporters";
 

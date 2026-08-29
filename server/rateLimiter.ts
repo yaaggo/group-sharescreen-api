@@ -5,6 +5,8 @@
 // bucket: it's cheap (one Map entry per key, no per-hit array/timer
 // bookkeeping) and "resets a little early at the window boundary" is an
 // acceptable trade for a spam guard, not a billing system.
+import { CLUSTER_ENABLED, busPublish, onBus } from "./clusterBus.js";
+
 interface Bucket {
   count: number;
   windowStart: number;
@@ -53,7 +55,24 @@ export function hitRateLimit(key: string, limit: number, windowMs: number): bool
 const VIOLATION_KEY_PREFIX = "violation:";
 
 export function recordViolation(ip: string, limit: number, windowMs: number): boolean {
+  // Unlike the per-message limiters below, this one is keyed by *IP* rather
+  // than by connection — and an IP's connections are spread across the
+  // cluster's workers, so counting only what this worker saw would mean a
+  // spammer needs N times as many violations to trip the auto-ban. Telling
+  // the other workers about the violation keeps every worker's bucket at the
+  // cluster-wide count, so whichever one sees the crossing hit is the one
+  // that bans, exactly once. No-op when not clustered.
+  busPublish("violation:hit", { ip, limit, windowMs });
   return !hitRateLimit(`${VIOLATION_KEY_PREFIX}${ip}`, limit, windowMs);
+}
+
+if (CLUSTER_ENABLED) {
+  // Records the violation another worker reported without acting on it: the
+  // worker that *saw* the offending message is the one that decides, so a
+  // replica returning true here would ban the same IP once per worker.
+  onBus("violation:hit", ({ ip, limit, windowMs }: { ip: string; limit: number; windowMs: number }) => {
+    hitRateLimit(`${VIOLATION_KEY_PREFIX}${ip}`, limit, windowMs);
+  });
 }
 
 // Per-connection rate limiting for WebSocket *messages* — a different

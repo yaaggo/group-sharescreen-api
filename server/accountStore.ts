@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import bcrypt from "bcryptjs";
-import { createClient } from "redis";
+import { getRedis } from "./redisClient.js";
 import { MONGO_ENABLED, connectMongo } from "./mongo.js";
 import { AccountModel, type AccountDoc, type OAuthIdentityDoc } from "./accountModels.js";
+import { CLUSTER_ENABLED, busPublish, onBus } from "./clusterBus.js";
 
 export interface PublicAccount {
   id: string;
@@ -81,6 +82,14 @@ try {
   // lifetime) if the filesystem isn't writable — e.g. a read-only container.
 }
 
+// Under node:cluster each worker loads these caches for itself at startup
+// and then only ever learns about its *own* writes — so an account created
+// on one worker would be unknown to the others, and its name would not be
+// reserved there (see isNameReserved, which the WS "register" handler gates
+// every display name on). syncAccountAcrossCluster below publishes the
+// account after every change that touches these indexes; replicas re-index
+// in memory only, since the worker that handled the request is the one that
+// persists. No-op when this process is the whole server. See clusterBus.ts.
 let accountsById = new Map<string, FullAccount>();
 let accountsByUsername = new Map<string, string>(); // folded username -> id
 // "<provider>:<providerUserId>" -> id. The provider's id is what a social
@@ -249,6 +258,7 @@ export async function addAccountPoints(accountId: string, amount: number): Promi
   if (!account) return null;
   account.points = (account.points ?? 0) + amount;
   account.updatedAt = Date.now();
+  syncAccountAcrossCluster(account);
   await persistAccountPointsIncrement(accountId, amount);
   return account.points;
 }
@@ -289,7 +299,40 @@ export async function addAccountCallStats(accountId: string, delta: CallStatsDel
   if (delta.micSeconds) account.micSeconds = (account.micSeconds ?? 0) + delta.micSeconds;
   if (delta.shareSeconds) account.shareSeconds = (account.shareSeconds ?? 0) + delta.shareSeconds;
   account.updatedAt = Date.now();
+  syncAccountAcrossCluster(account);
   await persistAccountCallStatsIncrement(accountId, delta);
+}
+
+// Drops every index entry an account currently holds. Split out of the
+// delete path in refreshAccountFromMongo below so re-indexing a *changed*
+// account (a renamed display name, an unlinked provider) can't leave the old
+// keys pointing at it.
+function unindexAccount(account: FullAccount) {
+  accountsById.delete(account.id);
+  accountsByUsername.delete(fold(account.username));
+  reservedNames.delete(fold(account.username));
+  reservedNames.delete(fold(account.displayName));
+  for (const identity of account.oauth) {
+    accountsByOAuth.delete(oauthIndexKey(identity.provider, identity.providerUserId));
+  }
+  if (account.email) accountsByVerifiedEmail.delete(fold(account.email));
+}
+
+// Publishes an account to the cluster's other workers so their caches match
+// this one's. Called from every mutation that changes what the in-memory
+// indexes answer — never from initAccountStore (each worker loads the same
+// data itself) nor from refreshAccountFromMongo (which every worker runs on
+// its own, against the same database).
+function syncAccountAcrossCluster(account: FullAccount) {
+  busPublish("account:sync", account);
+}
+
+if (CLUSTER_ENABLED) {
+  onBus("account:sync", (account: FullAccount) => {
+    const existing = accountsById.get(account.id);
+    if (existing) unindexAccount(existing);
+    indexAccount(account);
+  });
 }
 
 function indexAccount(account: FullAccount) {
@@ -366,26 +409,9 @@ export function getPublicAccountById(id: string): PublicAccount | null {
 // MongoDB read below — a 60s TTL cache, not a source of truth, so any
 // failure here just falls through to Mongo instead of blocking anything.
 const REDIS_URL = process.env.REDIS_URL;
-// `any` for the same reason as chatStore.ts's RedisClient alias — see its
-// doc comment.
-type RedisClient = any; // eslint-disable-line @typescript-eslint/no-explicit-any
-let redisReady: Promise<RedisClient> | null = null;
-
-async function getRedis(): Promise<RedisClient> {
-  if (redisReady) return redisReady;
-  const client = createClient({ url: REDIS_URL });
-  client.on("error", (err: Error) => {
-    console.error("[accountStore] Erro na conexão com o Redis:", err.message);
-  });
-  const connecting = client.connect().then(() => client);
-  redisReady = connecting;
-  try {
-    return await connecting;
-  } catch (err) {
-    redisReady = null;
-    throw err;
-  }
-}
+// The Redis connection is shared by every store in this process — see
+// redisClient.ts, which also wires REDIS_CA_CERT for a `rediss://` endpoint
+// whose certificate comes from a private CA.
 
 function redisAccountKey(id: string): string {
   return `sharescreen:account:${id}`;
@@ -535,6 +561,7 @@ export async function createAccount(
     oauth: [],
   };
   indexAccount(account);
+  syncAccountAcrossCluster(account);
   await persistNewAccount(account);
   return toPublicAccount(account);
 }
@@ -581,6 +608,7 @@ export async function createOAuthAccount(options: {
     oauth: [{ ...identity, linkedAt: now }],
   };
   indexAccount(account);
+  syncAccountAcrossCluster(account);
   await persistNewAccount(account);
   return toPublicAccount(account);
 }
@@ -637,6 +665,7 @@ export async function linkOAuthIdentity(
     }
     account.updatedAt = Date.now();
     indexAccount(account);
+    syncAccountAcrossCluster(account);
     await persistAccountIdentity(account);
   }
   return { ok: true, account: toPublicAccount(account) };
@@ -686,6 +715,7 @@ export async function unlinkOAuthProvider(
   }
   account.oauth = remaining;
   account.updatedAt = Date.now();
+  syncAccountAcrossCluster(account);
   await persistAccountIdentity(account);
   return "ok";
 }

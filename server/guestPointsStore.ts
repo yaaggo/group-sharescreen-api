@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { createClient } from "redis";
+import { getRedis } from "./redisClient.js";
 
 // Points held by a *guest* identity rather than an account.
 //
@@ -47,27 +47,9 @@ try {
 // long in storage and never by a single readable moment.
 const GUEST_POINTS_TTL_SECONDS = 30 * 24 * 60 * 60;
 
-// See chatStore.ts's identical `RedisClient` alias for why this is `any`
-// rather than a precise type.
-type RedisClient = any; // eslint-disable-line @typescript-eslint/no-explicit-any
-
-let redisReady: Promise<RedisClient> | null = null;
-
-async function getRedis(): Promise<RedisClient> {
-  if (redisReady) return redisReady;
-  const client = createClient({ url: REDIS_URL });
-  client.on("error", (err: Error) => {
-    console.error("[guestPointsStore] Erro na conexão com o Redis:", err.message);
-  });
-  const connecting = client.connect().then(() => client);
-  redisReady = connecting;
-  try {
-    return await connecting;
-  } catch (err) {
-    redisReady = null;
-    throw err;
-  }
-}
+// The Redis connection is shared by every store in this process — see
+// redisClient.ts, which also wires REDIS_CA_CERT for a `rediss://` endpoint
+// whose certificate comes from a private CA.
 
 function guestPointsKey(guestId: string): string {
   return `sharescreen:guestPoints:${guestId}`;

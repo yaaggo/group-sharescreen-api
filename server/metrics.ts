@@ -1,11 +1,36 @@
-import { Registry, collectDefaultMetrics, Gauge, Counter } from "prom-client";
+import { Registry, collectDefaultMetrics, Gauge, Counter, AggregatorRegistry } from "prom-client";
 import { CLIENT_PLATFORMS, type ClientPlatform } from "./clientPlatform.js";
+import { CLUSTER_ENABLED } from "./clusterBus.js";
+import { clusterHealth } from "./clusterInfo.js";
 
 export const register = new Registry();
 
 // CPU, memory (RSS/heap), event loop lag, GC, open file descriptors, etc. —
 // everything Node/prom-client can tell us about this process for free.
 collectDefaultMetrics({ register });
+
+// Every worker keeps its own registry; the primary merges them into a single
+// scrape (see clusterPrimary.ts and the /metrics route in index.ts). Two
+// things are needed for that on this side: telling prom-client to answer
+// the primary with *this* registry rather than the global one it defaults
+// to, and constructing an AggregatorRegistry at all, which is what installs
+// the worker-side listener that answers those collection requests.
+if (CLUSTER_ENABLED) {
+  AggregatorRegistry.setRegistries(register);
+  new AggregatorRegistry();
+}
+
+// How a metric is merged across workers when the primary aggregates them.
+//
+// prom-client sums by default, which is right for the counters further down
+// (each worker counts the events it handled, and the cluster's total is the
+// sum) but wrong for everything fed by registerStatsProvider below: those
+// gauges are already cluster-wide in *every* worker, because signaling.ts
+// replicates the connection and room state to all of them. Summing "people
+// online" across four workers that each already know about everyone would
+// report four times the site's actual population. "first" takes one
+// worker's answer, which is the whole answer.
+const REPLICATED_GAUGE_AGGREGATOR = "first" as const;
 
 export type RoomStats = {
   handle: string;
@@ -53,6 +78,17 @@ export type LocationStats = {
   count: number;
 };
 
+// How the cluster's connections are split across the processes actually
+// terminating them (see ClientInfo.worker in server/signaling.ts). Only
+// workers with at least one connection appear here; the gauges below fill in
+// the idle ones from the primary's roster, so a worker sitting at zero is
+// still visible rather than silently missing.
+export type WorkerStats = {
+  id: number;
+  sockets: number;
+  registeredPeers: number;
+};
+
 export type SignalingStats = {
   connectedSockets: number;
   registeredPeers: number;
@@ -60,6 +96,7 @@ export type SignalingStats = {
   platforms: PlatformStats;
   rooms: RoomStats[];
   locations: LocationStats[];
+  workers: WorkerStats[];
 };
 
 const emptyStats: SignalingStats = {
@@ -69,6 +106,7 @@ const emptyStats: SignalingStats = {
   platforms: emptyPlatformStats(),
   rooms: [],
   locations: [],
+  workers: [],
 };
 
 // signaling.ts owns the actual connection/room state; it hands us a getter
@@ -91,6 +129,7 @@ new Gauge({
   name: "sharescreen_connected_sockets",
   help: "WebSocket connections currently open on the signaling server",
   registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
   collect() {
     this.set(getStats().connectedSockets);
   },
@@ -100,6 +139,7 @@ new Gauge({
   name: "sharescreen_registered_peers",
   help: "Connected sockets that have completed name registration",
   registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
   collect() {
     this.set(getStats().registeredPeers);
   },
@@ -110,6 +150,7 @@ new Gauge({
   help: "Registered peers broken down by identity kind: a logged-in account, a guest whose token-proven identity protects it from session takeover (see isSameOwner), or a guest with no such proof yet (old client, or not yet through its first token round-trip)",
   labelNames: ["kind"],
   registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
   collect() {
     const { identities } = getStats();
     this.set({ kind: "account" }, identities.accounts);
@@ -123,6 +164,7 @@ new Gauge({
   help: "Registered peers by the kind of client they're using: an ordinary browser or an embedded WebView (an in-app browser such as Instagram's or Facebook's), on a phone/tablet or on a PC, plus GoLive's own desktop app. Same population as sharescreen_registered_peers, so the two always sum to the same number. \"unknown\" is a connection whose kind couldn't be established rather than a PC — see server/clientPlatform.ts.",
   labelNames: ["platform"],
   registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
   collect() {
     const { platforms } = getStats();
     // No reset() here, unlike the room/location gauges below: the label set
@@ -139,6 +181,7 @@ new Gauge({
   help: "Active rooms (at least one person connected), by visibility",
   labelNames: ["visibility"],
   registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
   collect() {
     const { rooms } = getStats();
     this.set({ visibility: "public" }, rooms.filter((r) => !r.isPrivate).length);
@@ -151,6 +194,7 @@ new Gauge({
   help: "People connected per public room. Private rooms are intentionally never labeled by handle here — /metrics has no access control by default, and doing so would leak private room identities to anyone who finds this endpoint, defeating the point of them being private. See sharescreen_private_room_top_people for an anonymized view.",
   labelNames: ["room"],
   registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
   collect() {
     // A labeled Gauge remembers every label combination it has ever seen
     // and keeps reporting the last value forever, even after that room is
@@ -168,6 +212,7 @@ new Gauge({
   help: "People actively broadcasting their screen/camera, per public room. Private rooms excluded for the same reason as sharescreen_room_people — see sharescreen_sharing_screen_total for the aggregate across all rooms.",
   labelNames: ["room"],
   registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
   collect() {
     this.reset();
     for (const r of getStats().rooms) {
@@ -180,6 +225,7 @@ new Gauge({
   name: "sharescreen_sharing_screen_total",
   help: "People actively broadcasting their screen/camera right now, across all rooms (public and private combined)",
   registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
   collect() {
     const total = getStats().rooms.reduce((sum, r) => sum + r.sharingCount, 0);
     this.set(total);
@@ -190,6 +236,7 @@ new Gauge({
   name: "sharescreen_private_rooms_people_total",
   help: "Total people currently in any private room combined",
   registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
   collect() {
     const total = getStats()
       .rooms.filter((r) => r.isPrivate)
@@ -203,6 +250,7 @@ new Gauge({
   help: `Sizes of the ${TOP_PRIVATE_ROOMS} largest private rooms, ranked but not identified — gives capacity/activity visibility without exposing which private room it is`,
   labelNames: ["rank"],
   registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
   collect() {
     // Same reasoning as sharescreen_room_people: without this, a rank that
     // no longer has a private room behind it (fewer private rooms now than
@@ -218,6 +266,114 @@ new Gauge({
     }
   },
 });
+
+// ─── Cluster ──────────────────────────────────────────────────────────────
+//
+// All of these are aggregated with "first" for the same reason the gauges
+// above are: every worker already knows the whole cluster (the roster comes
+// from the primary, the connection split comes from the replicated state in
+// signaling.ts), so summing them across workers would report each number N
+// times over.
+//
+// Unclustered they still work and describe the single process, which reports
+// itself as worker 0 — a dashboard doesn't need to know which mode it is
+// looking at.
+
+new Gauge({
+  name: "sharescreen_cluster_workers_online",
+  help: "Workers currently accepting connections. Below sharescreen_cluster_workers_configured means one is still booting or is being replaced",
+  registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
+  collect() {
+    this.set(clusterHealth().online);
+  },
+});
+
+new Gauge({
+  name: "sharescreen_cluster_workers_configured",
+  help: "Workers the primary was told to run (CLUSTER_WORKERS, defaulting to one per available core). 1 when clustering is off",
+  registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
+  collect() {
+    this.set(clusterHealth().configured);
+  },
+});
+
+new Gauge({
+  name: "sharescreen_cluster_worker_restarts",
+  help: "Workers replaced since the primary started. Deliberately a gauge and not a _total counter: it is the primary's own tally and goes back to zero when the primary restarts, which a counter's reset semantics would misreport as the process having been redeployed. A number that keeps climbing means something is killing workers",
+  registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
+  collect() {
+    this.set(clusterHealth().restarts);
+  },
+});
+
+new Gauge({
+  name: "sharescreen_cluster_worker_up",
+  help: "1 while a worker is accepting connections, 0 while it is forked but not yet listening (booting, or connecting to Mongo/Redis)",
+  labelNames: ["worker", "pid"],
+  registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
+  collect() {
+    // Same reasoning as sharescreen_room_people: worker ids are never reused
+    // and a replaced worker brings a new pid with it, so without reset() every
+    // worker that ever ran would keep reporting forever.
+    this.reset();
+    for (const w of clusterHealth().workers) {
+      this.set({ worker: String(w.id), pid: String(w.pid) }, w.listening ? 1 : 0);
+    }
+  },
+});
+
+new Gauge({
+  name: "sharescreen_cluster_worker_uptime_seconds",
+  help: "How long each worker has been up, since the primary forked it — a worker whose uptime keeps resetting is one that keeps dying",
+  labelNames: ["worker"],
+  registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
+  collect() {
+    this.reset();
+    for (const w of clusterHealth().workers) this.set({ worker: String(w.id) }, w.uptimeSeconds);
+  },
+});
+
+new Gauge({
+  name: "sharescreen_worker_connected_sockets",
+  help: "Open WebSocket connections by the worker actually terminating them. Sums to sharescreen_connected_sockets; a lopsided split means connections are not being spread evenly (see CLUSTER_SCHEDULING)",
+  labelNames: ["worker"],
+  registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
+  collect() {
+    this.reset();
+    for (const w of workerBreakdown()) this.set({ worker: String(w.id) }, w.sockets);
+  },
+});
+
+new Gauge({
+  name: "sharescreen_worker_registered_peers",
+  help: "Connections that have completed name registration, by the worker terminating them. Sums to sharescreen_registered_peers",
+  labelNames: ["worker"],
+  registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
+  collect() {
+    this.reset();
+    for (const w of workerBreakdown()) this.set({ worker: String(w.id) }, w.registeredPeers);
+  },
+});
+
+// The connection split, with every live worker present even when it is
+// holding nothing — signaling.ts only reports workers that have connections,
+// and a worker missing from a graph is indistinguishable from a worker that
+// died, which is the opposite of what these are for.
+function workerBreakdown(): WorkerStats[] {
+  const byId = new Map<number, WorkerStats>();
+  for (const w of clusterHealth().workers) {
+    byId.set(w.id, { id: w.id, sockets: 0, registeredPeers: 0 });
+  }
+  for (const w of getStats().workers) byId.set(w.id, w);
+  return [...byId.values()].sort((a, b) => a.id - b.id);
+}
 
 export const wsConnectionsTotal = new Counter({
   name: "sharescreen_ws_connections_total",
@@ -319,6 +475,7 @@ export const connectionsByLocationGauge = new Gauge({
   help: "Current WebSocket connections by approximate GeoIP location (country, and lat/lon rounded to ~11km)",
   labelNames: ["country", "lat", "lon"],
   registers: [register],
+  aggregator: REPLICATED_GAUGE_AGGREGATOR,
   collect() {
     this.reset();
     for (const loc of getStats().locations) {
