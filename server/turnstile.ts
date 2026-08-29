@@ -20,6 +20,7 @@ const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || null;
 export const TURNSTILE_ENABLED = process.env.TURNSTILE_ENABLED === "true" && TURNSTILE_SECRET_KEY !== null;
 
 const SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+
 // Cloudflare's own guidance: treat a slow/unreachable siteverify call as a
 // failure rather than hanging the client's join indefinitely.
 const VERIFY_TIMEOUT_MS = 5_000;
