@@ -1217,6 +1217,11 @@ function isLocalClient(info: ClientInfo): boolean {
 
 const remoteSendBatches = new Map<number, [string, string][]>();
 const dirtyClients = new Set<ClientInfo>();
+// The last snapshot actually published for each local connection, keyed by
+// connKey — see flushClusterOutbox for what it's for. Only ever holds
+// connections this worker owns, and an entry is dropped the moment one goes
+// away (publishClientRemoval).
+const lastPublishedClient = new Map<string, string>();
 const pendingClusterEvents: { topic: string; payload: unknown }[] = [];
 let clusterFlushScheduled = false;
 
@@ -1237,7 +1242,34 @@ function flushClusterOutbox(): void {
   // state ahead of the events referencing it keeps a replica from briefly
   // holding a stale view of someone who just changed.
   if (dirtyClients.size > 0) {
-    for (const info of dirtyClients) busPublish("client:upsert", clientSnapshot(info));
+    for (const info of dirtyClients) {
+      // syncClient marks a connection dirty after *every* message it sends,
+      // which is what makes replication impossible to forget — no handler has
+      // to remember to announce what it touched. The cost of that blanket
+      // rule is that the highest-volume traffic on this server changes
+      // nothing about the connection at all: a WebRTC "signal" is relayed to
+      // someone else, a "time-sync" is answered from the clock, a "typing" is
+      // forwarded and dropped. Publishing an identical snapshot for each of
+      // those means an IPC message to every other worker, plus a parse and an
+      // assign on each of them, to install state they already have.
+      //
+      // Comparing against what was last published is what removes that.
+      // Serializing the snapshot to compare it is not free either, but it is
+      // one stringify against a fan-out of (workers - 1) messages, so on the
+      // paths that dominate this server's traffic it is the difference
+      // between a couple of microseconds and a couple of hundred.
+      //
+      // Deliberately the *whole* snapshot rather than a hand-listed set of
+      // "fields that can change": a list like that is one forgotten field
+      // away from a change that silently never replicates, and the fields it
+      // would save are a User-Agent and an IP — cheap to include, and free of
+      // that failure mode.
+      const snapshot = clientSnapshot(info);
+      const serialized = JSON.stringify(snapshot);
+      if (lastPublishedClient.get(info.connKey) === serialized) continue;
+      lastPublishedClient.set(info.connKey, serialized);
+      busPublish("client:upsert", snapshot);
+    }
     dirtyClients.clear();
   }
   if (pendingClusterEvents.length > 0) {
@@ -1272,6 +1304,10 @@ function syncClient(info: ClientInfo): void {
 }
 
 function publishClientRemoval(info: ClientInfo): void {
+  // Ahead of the guard on purpose: an entry here outliving the connection it
+  // describes would be a leak, and this is the one place every local
+  // connection passes through on its way out.
+  lastPublishedClient.delete(info.connKey);
   if (!CLUSTER_ENABLED) return;
   dirtyClients.delete(info);
   clusterEvent("client:remove", { connKey: info.connKey });

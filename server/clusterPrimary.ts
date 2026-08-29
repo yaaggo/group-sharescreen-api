@@ -21,20 +21,24 @@ import { isBusEnvelope, type BusEnvelope } from "./clusterBus.js";
 // How many workers to fork. Defaults to one per available core; set
 // CLUSTER_WORKERS=1 to turn clustering off entirely (the primary then runs
 // the server inline, exactly as it did before this existed).
+// availableParallelism respects cgroup CPU limits, which os.cpus() doesn't —
+// inside a container capped at 2 cores, os.cpus() would report the host's 32
+// and fork 32 workers that all fight over the same two.
+export function availableCores(): number {
+  try {
+    return Math.max(1, availableParallelism());
+  } catch {
+    return 1;
+  }
+}
+
 export function resolveWorkerCount(): number {
   const raw = process.env.CLUSTER_WORKERS;
   if (raw !== undefined && raw !== "") {
     const parsed = Number(raw);
     if (Number.isFinite(parsed) && parsed >= 1) return Math.floor(parsed);
   }
-  // availableParallelism respects cgroup CPU limits, which os.cpus() doesn't
-  // — inside a container capped at 2 cores, os.cpus() would report the
-  // host's 32 and fork 32 workers that all fight over the same two.
-  try {
-    return Math.max(1, availableParallelism());
-  } catch {
-    return 1;
-  }
+  return availableCores();
 }
 
 // Aggregates every worker's Prometheus registry into one scrape (see the
