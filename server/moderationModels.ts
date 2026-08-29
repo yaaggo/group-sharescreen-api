@@ -21,7 +21,7 @@ export interface BanDoc {
   createdAt: number;
   // null means permanent — never auto-expires.
   expiresAt: number | null;
-}
+} 
 
 const banSchema = new Schema<BanDoc>(
   {
