@@ -2,7 +2,7 @@
 // does nothing but supervise and relay.
 //
 // The point of this file is that it is the *only* thing the primary runs.
-// It never imports signaling.ts, Fastify, mongoose or geoip — those all live
+// It never imports signaling.ts, Fastify or mongoose — those all live
 // in the workers, so the primary stays a small, idle process whose event
 // loop is free to move IPC traffic around instead of competing with the
 // server for the same core.

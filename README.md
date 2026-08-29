@@ -21,7 +21,7 @@ mesma porta, sem mudar nada para o front nem para o proxy reverso.
 | `CLUSTER_SCHEDULING` | `rr` (round-robin) ou `none` (o SO decide). Padrão do Node: round-robin em tudo menos Windows. Só mexa se estiver desenvolvendo no Windows e quiser distribuição de verdade entre os workers |
 
 Cada worker é um processo Node inteiro: conta memória vezes o número de
-workers (a base do geoip-lite e o driver do Mongo são carregados em cada um).
+workers (o driver do Mongo é carregado em cada um).
 Em container apertado, prefira fixar `CLUSTER_WORKERS` em vez de deixar no
 automático.
 

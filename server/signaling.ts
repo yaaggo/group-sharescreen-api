@@ -14,12 +14,10 @@ import {
   autoBansTotal,
   turnstileVerificationsTotal,
   emptyPlatformStats,
-  type LocationStats,
   type WorkerStats,
 } from "./metrics.js";
 import { recordViolation } from "./rateLimiter.js";
 import { verifyTurnstileToken, TURNSTILE_ENABLED } from "./turnstile.js";
-import { lookupConnectionLocation, type ConnectionLocation } from "./geoip.js";
 import {
   classifyClientPlatform,
   parseDeviceReport,
@@ -340,14 +338,6 @@ interface ClientInfo {
   // sent to regular participants — only /admin/rooms exposes it, so a
   // moderator can ban whoever's misbehaving straight from the room list.
   ip: string;
-  // GeoIP-derived approximate location of `ip` (see geoip.ts), resolved
-  // once at connect time — null when it couldn't be placed (private/local
-  // address, unroutable range, etc.). Read by registerStatsProvider's
-  // locations breakdown (see metrics.ts's connectionsByLocationGauge) on
-  // every Prometheus scrape; cached here just to avoid re-doing the lookup
-  // on every single scrape (it's deterministic for a given `ip`, so once is
-  // enough for this connection's whole lifetime).
-  geoLocation: ConnectionLocation | null;
   // The kind of client on the other end — which of /metrics's platform
   // buckets this connection counts towards (see clientPlatform.ts, and
   // metrics.ts's clientsByPlatformGauge). Derived from the User-Agent at
@@ -355,7 +345,7 @@ interface ClientInfo {
   // then re-derived once on "register" if the client reported its own
   // device, which is the better answer for everything except the
   // browser-vs-WebView half. Cached here rather than recomputed on every
-  // Prometheus scrape for the same reason geoLocation above is.
+  // Prometheus scrape, since it's fixed for this connection's whole lifetime.
   platform: ClientPlatform;
   // The upgrade request's User-Agent, kept only so `platform` can be
   // re-derived when the register-time device report arrives — by then the
@@ -1849,18 +1839,10 @@ registerStatsProvider(() => {
     else identities.guestsWithoutToken += 1;
     platforms[c.platform] += 1;
   }
-  // Keyed by "country|lat|lon" purely to dedupe while counting — the actual
-  // label values are read back out of each entry below, not parsed from the
-  // key. Only ever holds entries for locations with a connection *right
-  // now* (see connectionsByLocationGauge's doc comment for why that's the
-  // point of recomputing this fresh on every scrape instead of tracking it
-  // incrementally).
-  const locationCounts = new Map<string, LocationStats>();
   // Which worker is actually terminating each socket (see ClientInfo.worker).
   // Every worker holds the entire cluster's connections, so any one of them
   // can report the whole split — which is why the gauges built from this are
-  // aggregated with "first" instead of summed. Counted in this same pass
-  // rather than its own, since it needs exactly the same walk.
+  // aggregated with "first" instead of summed.
   const workerCounts = new Map<number, WorkerStats>();
   for (const c of clients.values()) {
     let workerEntry = workerCounts.get(c.worker);
@@ -1870,11 +1852,6 @@ registerStatsProvider(() => {
     }
     workerEntry.sockets += 1;
     if (c.name !== null && !c.isModerator) workerEntry.registeredPeers += 1;
-    if (!c.geoLocation) continue;
-    const key = `${c.geoLocation.country}|${c.geoLocation.lat}|${c.geoLocation.lon}`;
-    const entry = locationCounts.get(key);
-    if (entry) entry.count += 1;
-    else locationCounts.set(key, { ...c.geoLocation, count: 1 });
   }
   return {
     connectedSockets: clients.size,
@@ -1887,7 +1864,6 @@ registerStatsProvider(() => {
       sharingCount: realSharingCount(info),
       isPrivate: isPrivateRoom(handle),
     })),
-    locations: [...locationCounts.values()],
     workers: [...workerCounts.values()].sort((a, b) => a.id - b.id),
   };
 });
@@ -2288,7 +2264,7 @@ function realPeopleCount(roomInfo: RoomInfo): number {
 
 // Same real-people rule as realPeopleCount, but counting only those actually
 // broadcasting their screen/camera right now (info.sharing), for the
-// sharescreen_room_sharing_screen / sharescreen_sharing_screen_total metrics.
+// sharescreen_sharing_screen_total metric.
 function realSharingCount(roomInfo: RoomInfo): number {
   let count = 0;
   for (const s of roomInfo.sockets) {
@@ -3560,7 +3536,6 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       isAlive: true,
       socket,
       ip,
-      geoLocation: lookupConnectionLocation(ip),
       userAgent,
       platform: classifyClientPlatform(userAgent, null),
       worker: WORKER_ID,

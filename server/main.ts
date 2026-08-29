@@ -3,8 +3,7 @@
 // Decides, once, whether this process is the cluster's supervisor or one of
 // its workers, and then loads only what that role needs — the imports are
 // dynamic on purpose. A static `import "./index.js"` would pull Fastify,
-// mongoose, geoip's in-memory database and the whole of signaling.ts into
-// the primary too, which never serves a request and shouldn't be paying for
+// mongoose and the whole of signaling.ts into the primary too, which never serves a request and shouldn't be paying for
 // any of it.
 //
 // With CLUSTER_WORKERS=1 (or a single available core) nothing is forked at

@@ -67,17 +67,6 @@ export function emptyPlatformStats(): PlatformStats {
   return Object.fromEntries(CLIENT_PLATFORMS.map((p) => [p, 0])) as PlatformStats;
 }
 
-// A count of currently-connected sockets sharing one GeoIP location (see
-// server/geoip.ts) — country plus lat/lon already rounded to ~11km. Entries
-// only ever exist for locations with at least one connection *right now*;
-// see connectionsByLocationGauge below for why that matters.
-export type LocationStats = {
-  country: string;
-  lat: string;
-  lon: string;
-  count: number;
-};
-
 // How the cluster's connections are split across the processes actually
 // terminating them (see ClientInfo.worker in server/signaling.ts). Only
 // workers with at least one connection appear here; the gauges below fill in
@@ -95,7 +84,6 @@ export type SignalingStats = {
   identities: IdentityStats;
   platforms: PlatformStats;
   rooms: RoomStats[];
-  locations: LocationStats[];
   workers: WorkerStats[];
 };
 
@@ -105,7 +93,6 @@ const emptyStats: SignalingStats = {
   identities: { accounts: 0, guestsWithToken: 0, guestsWithoutToken: 0 },
   platforms: emptyPlatformStats(),
   rooms: [],
-  locations: [],
   workers: [],
 };
 
@@ -167,7 +154,7 @@ new Gauge({
   aggregator: REPLICATED_GAUGE_AGGREGATOR,
   collect() {
     const { platforms } = getStats();
-    // No reset() here, unlike the room/location gauges below: the label set
+    // No reset() here, unlike the labeled gauges below: the label set
     // is this fixed list and every one of them is written on every scrape,
     // so there is no such thing as a stale combination to drop.
     for (const platform of CLIENT_PLATFORMS) {
@@ -186,38 +173,6 @@ new Gauge({
     const { rooms } = getStats();
     this.set({ visibility: "public" }, rooms.filter((r) => !r.isPrivate).length);
     this.set({ visibility: "private" }, rooms.filter((r) => r.isPrivate).length);
-  },
-});
-
-new Gauge({
-  name: "sharescreen_room_people",
-  help: "People connected per public room. Private rooms are intentionally never labeled by handle here — /metrics has no access control by default, and doing so would leak private room identities to anyone who finds this endpoint, defeating the point of them being private. See sharescreen_private_room_top_people for an anonymized view.",
-  labelNames: ["room"],
-  registers: [register],
-  aggregator: REPLICATED_GAUGE_AGGREGATOR,
-  collect() {
-    // A labeled Gauge remembers every label combination it has ever seen
-    // and keeps reporting the last value forever, even after that room is
-    // long gone — reset() first so a room that emptied out actually drops
-    // out of the exposed metrics instead of showing phantom people.
-    this.reset();
-    for (const r of getStats().rooms) {
-      if (!r.isPrivate) this.set({ room: r.handle }, r.peopleCount);
-    }
-  },
-});
-
-new Gauge({
-  name: "sharescreen_room_sharing_screen",
-  help: "People actively broadcasting their screen/camera, per public room. Private rooms excluded for the same reason as sharescreen_room_people — see sharescreen_sharing_screen_total for the aggregate across all rooms.",
-  labelNames: ["room"],
-  registers: [register],
-  aggregator: REPLICATED_GAUGE_AGGREGATOR,
-  collect() {
-    this.reset();
-    for (const r of getStats().rooms) {
-      if (!r.isPrivate) this.set({ room: r.handle }, r.sharingCount);
-    }
   },
 });
 
@@ -252,9 +207,10 @@ new Gauge({
   registers: [register],
   aggregator: REPLICATED_GAUGE_AGGREGATOR,
   collect() {
-    // Same reasoning as sharescreen_room_people: without this, a rank that
-    // no longer has a private room behind it (fewer private rooms now than
-    // before) would keep reporting its last stale size forever.
+    // A labeled Gauge remembers every label combination it has ever seen and
+    // keeps reporting the last value forever — reset() first so a rank that no
+    // longer has a private room behind it (fewer private rooms now than
+    // before) stops reporting its last stale size.
     this.reset();
     const sizes = getStats()
       .rooms.filter((r) => r.isPrivate)
@@ -316,7 +272,8 @@ new Gauge({
   registers: [register],
   aggregator: REPLICATED_GAUGE_AGGREGATOR,
   collect() {
-    // Same reasoning as sharescreen_room_people: worker ids are never reused
+    // Same reasoning as sharescreen_private_room_top_people: worker ids are
+    // never reused
     // and a replaced worker brings a new pid with it, so without reset() every
     // worker that ever ran would keep reporting forever.
     this.reset();
@@ -452,34 +409,3 @@ export const turnstileVerificationsTotal = new Counter({
   registers: [register],
 });
 
-// Current WebSocket connections by approximate client location (GeoIP —
-// see geoip.ts's lookupConnectionLocation) — built for a Grafana Geomap
-// panel in "Coords" mode using the lat/lon labels directly. country is an
-// ISO 3166-1 alpha-2 code, also usable on its own via `sum by (country)`
-// for a country-level breakdown. A connection whose IP couldn't be placed
-// (private/local address, unroutable range, or just missing from the
-// offline database) is never counted here at all — see signaling.ts's "/ws"
-// handler — rather than showing up as a pile of connections at 0,0.
-//
-// Recomputed from scratch on every scrape (via getStats().locations) rather
-// than incremented/decremented as connections open/close: same reasoning as
-// sharescreen_room_people above — a plain inc()/dec()'d labeled Gauge
-// remembers every distinct label combination it has *ever* seen and keeps
-// reporting it (stuck at 0) forever once no one's left there, and unlike a
-// room count, distinct (country, lat, lon) triples only ever accumulate
-// over a long-running process's whole lifetime as visitors come from more
-// and more places — reset() first is what keeps this bounded by "how many
-// locations have someone connected *right now*" instead of "how many ever."
-export const connectionsByLocationGauge = new Gauge({
-  name: "sharescreen_connections_by_location",
-  help: "Current WebSocket connections by approximate GeoIP location (country, and lat/lon rounded to ~11km)",
-  labelNames: ["country", "lat", "lon"],
-  registers: [register],
-  aggregator: REPLICATED_GAUGE_AGGREGATOR,
-  collect() {
-    this.reset();
-    for (const loc of getStats().locations) {
-      this.set({ country: loc.country, lat: loc.lat, lon: loc.lon }, loc.count);
-    }
-  },
-});
