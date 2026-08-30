@@ -614,7 +614,12 @@ interface RoomInfo extends RoomRecord {
   // isSameOwner and the "join"/"register" handlers). Keyed the same way the
   // old global `namesInUse` map used to be (lowercased name -> holder).
   names: Map<string, WebSocket>;
+  // Temporary kick cooldown: userId -> expiration timestamp in ms.
+  // Prevents kicked users from immediately re-entering and spamming the room.
+  kickedMembers?: Map<string, number>;
 }
+
+const ROOM_KICK_COOLDOWN_MS = 10_000;
 
 // The stable identity a room's ownership is keyed on — an account's id if
 // logged in, otherwise the guest id minted for this connection in
@@ -1648,6 +1653,14 @@ if (CLUSTER_ENABLED) {
     clearRoomDeletionTimer(room);
     clearOwnershipHandoverTimer(room);
     rooms.delete(room);
+  });
+
+  onBus("room:kick", ({ room, userId, until }: { room: string; userId: string; until: number }) => {
+    const roomInfo = rooms.get(room);
+    if (roomInfo) {
+      if (!roomInfo.kickedMembers) roomInfo.kickedMembers = new Map();
+      roomInfo.kickedMembers.set(userId, until);
+    }
   });
 
   onBus(
@@ -4289,6 +4302,21 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             send(socket, { type: "join-error", message: "Você foi banido desta sala pela administração." });
             return;
           }
+          if (existingRoomInfo && existingRoomInfo.kickedMembers?.has(targetUserId)) {
+            const until = existingRoomInfo.kickedMembers.get(targetUserId)!;
+            const remainingMs = until - Date.now();
+            if (remainingMs > 0) {
+              const remainingSec = Math.ceil(remainingMs / 1000);
+              send(socket, {
+                type: "join-error",
+                message: `Você foi expulso da sala. Você poderá retornar em ${remainingSec} segundo${remainingSec > 1 ? "s" : ""}.`,
+                kickedCooldown: remainingSec,
+              });
+              return;
+            } else {
+              existingRoomInfo.kickedMembers.delete(targetUserId);
+            }
+          }
           const nameKey = info.name.toLowerCase();
           const holderSocket = existingRoomInfo?.names.get(nameKey);
           if (holderSocket && holderSocket !== socket) {
@@ -4404,6 +4432,21 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (roomInfo.bannedMembers.some((b) => b.id === targetUserId)) {
             send(socket, { type: "join-error", message: "Você foi banido desta sala pela administração." });
             return;
+          }
+          if (roomInfo.kickedMembers?.has(targetUserId)) {
+            const until = roomInfo.kickedMembers.get(targetUserId)!;
+            const remainingMs = until - Date.now();
+            if (remainingMs > 0) {
+              const remainingSec = Math.ceil(remainingMs / 1000);
+              send(socket, {
+                type: "join-error",
+                message: `Você foi expulso da sala. Você poderá retornar em ${remainingSec} segundo${remainingSec > 1 ? "s" : ""}.`,
+                kickedCooldown: remainingSec,
+              });
+              return;
+            } else {
+              roomInfo.kickedMembers.delete(targetUserId);
+            }
           }
           // If the in-memory room had 0 sockets and its previous owner was a guest or is absent,
           // hand over ownership to the active joiner immediately.
@@ -4781,6 +4824,13 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           const callerId = stableUserId(info);
           if (targetUserId === callerId) return;
 
+          if (!roomInfo.kickedMembers) {
+            roomInfo.kickedMembers = new Map();
+          }
+          const kickUntil = Date.now() + ROOM_KICK_COOLDOWN_MS;
+          roomInfo.kickedMembers.set(targetUserId, kickUntil);
+          clusterEvent("room:kick", { room: info.room, userId: targetUserId, until: kickUntil });
+
           const targets = [...roomInfo.sockets]
             .map((s) => ({ socket: s, client: clients.get(s) }))
             .filter(
@@ -4796,6 +4846,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             send(target.socket, {
               type: "room-kicked",
               message: "Você foi expulso da sala pela administração.",
+              cooldownSeconds: 10,
             });
             leaveRoom(target.client);
           }
