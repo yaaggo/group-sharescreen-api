@@ -4063,6 +4063,13 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           // flushClientStats) — never for a moderator's admin-join ghost
           // connection, which never reaches this branch anyway.
           info.joinedAt = Date.now();
+          // Whether *this* join is what brought the room into existence, as
+          // opposed to walking into one that was already up or one being
+          // reloaded from its persisted record. Sent back in "room-state"
+          // below so the client can greet whoever just created a room (see
+          // WatchRoom's new-public-room popup) — nobody else's join says
+          // anything about it, since only this socket gets that answer.
+          let roomWasCreated = false;
           let roomInfo = rooms.get(room);
           if (!roomInfo) {
             // Reloads any chat history and RoomRecord still persisted
@@ -4115,6 +4122,10 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
                 ...record,
               };
               rooms.set(room, roomInfo);
+              // A room coming back from its RoomRecord is not a new room —
+              // it has been placed on the map, described and configured
+              // before, and its owner has already been through all of that.
+              roomWasCreated = !existingRecord;
               publishRoomCreated(room, roomInfo);
               roomsCreatedTotal.inc({ visibility: isPrivateRoom(room) ? "private" : "public" });
               if (!existingRecord) void saveRoomRecord(room, record);
@@ -4137,6 +4148,9 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           send(socket, {
             type: "room-state",
             room,
+            // See roomWasCreated above. Only ever true for the one socket
+            // whose join created the room.
+            created: roomWasCreated,
             selfId: info.id,
             // The identity a video source is attributed to (see
             // RoomVideoSource.addedById and peerSummary's `userId`) — the
