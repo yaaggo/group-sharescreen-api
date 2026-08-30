@@ -16,7 +16,7 @@ import Fastify from "fastify";
 import websocketPlugin from "@fastify/websocket";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
-import { registerSignalingRoutes } from "./signaling.js";
+import { registerSignalingRoutes, ADMIN_WS_PROTOCOL } from "./signaling.js";
 import { register as metricsRegister, httpRateLimitedTotal } from "./metrics.js";
 import { initModerationStore } from "./moderationStore.js";
 import { initAccountStore } from "./accountStore.js";
@@ -82,7 +82,24 @@ async function main() {
     exposedHeaders: "*",
   });
   await app.register(websocketPlugin, {
-    options: { maxPayload: 64 * 1024 },
+    options: {
+      maxPayload: 64 * 1024,
+      // A browser aborts the handshake outright when it offered subprotocols
+      // and the response names none, so a moderator presenting its admin
+      // token this way (see ADMIN_WS_PROTOCOL in signaling.ts) needs the
+      // marker echoed back. Only ever the marker — never the token that
+      // follows it, which has no business in a response header.
+      //
+      // Anything else offered is declined rather than reflected, which is
+      // tighter than ws's default of echoing back whatever came first. No
+      // client of this server offers a subprotocol for any other reason, so
+      // there is nothing to preserve there.
+      //
+      // Called only when the client actually offered something (see ws's
+      // completeUpgrade), so an ordinary connection never reaches this.
+      handleProtocols: (protocols: Set<string>) =>
+        protocols.has(ADMIN_WS_PROTOCOL) ? ADMIN_WS_PROTOCOL : false,
+    },
   });
 
   // Global default: applies to every route below unless overridden via that

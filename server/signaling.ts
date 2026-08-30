@@ -146,6 +146,32 @@ const MAX_SUPPORTERS = 500;
 const AUTO_BAN_VIOLATION_LIMIT = 6;
 const AUTO_BAN_VIOLATION_WINDOW_MS = 60_000;
 const AUTO_BAN_DURATION_MINUTES = 60;
+// WebSocket subprotocol a moderator connection offers at the upgrade,
+// followed by its admin JWT (see the admin client's openSocket). It exists
+// only so the "/ws" upgrade limiter can tell a moderator apart from an
+// anonymous connection *before* the socket exists — the limiter's ceiling is
+// per-IP and per-attempt, so by the time the first message arrives it has
+// already decided. Nothing is authorized by presenting it: the token is
+// re-verified here for the budget, and again in "admin-join" before the
+// socket is ever put in a room.
+//
+// The subprotocol header rather than a query parameter because a URL ends up
+// in proxy and access logs and this one would carry a live admin token; a
+// request header does not get logged that way. A JWT is a valid subprotocol
+// token as-is (base64url plus "." are all tchar), so it needs no encoding.
+export const ADMIN_WS_PROTOCOL = "golive-admin";
+// The moderator budget the marker above buys. The camera wall watches one
+// room per WebSocket — a moderator connection is inherently single-room (see
+// "admin-join" below) — so a wall at its MAX_WATCHED_ROOMS of 100 opens a
+// hundred upgrades in the space of a few seconds, which is five times the
+// anonymous ceiling on its own. This covers that, a reload inside the same
+// window, and the reconnect churn of rooms that come and go, with room to
+// spare. Still a real ceiling and still per-IP: a leaked admin token buys a
+// bigger connection budget, not an unbounded one.
+const ADMIN_WS_UPGRADE_MAX = 300;
+// What everyone else gets. Comfortably covers a real client's reconnect
+// backoff, sleep/wake and page reloads while bounding a connection flood.
+const WS_UPGRADE_MAX = 30;
 // How long a passed Turnstile challenge is remembered before the next join
 // requires a fresh one again — without an expiry, a single solved challenge
 // would cover joins forever (a WS socket doesn't expire on its own, and a
@@ -3506,6 +3532,21 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
     return { enabled };
   });
 
+  // Whether this upgrade presented a valid ADMIN token in its subprotocol
+  // header (see ADMIN_WS_PROTOCOL). Used only to pick which upgrade budget
+  // this attempt is charged against — a forged or expired token simply falls
+  // back to the anonymous one, it never fails the upgrade, because refusing
+  // here would be a second, redundant auth gate in front of the one
+  // "admin-join" already runs on the token itself.
+  function isAdminUpgrade(request: FastifyRequest): boolean {
+    const raw = request.headers["sec-websocket-protocol"];
+    if (typeof raw !== "string") return false;
+    const parts = raw.split(",").map((p) => p.trim());
+    if (parts[0] !== ADMIN_WS_PROTOCOL || !parts[1]) return false;
+    const payload = verifyToken(parts[1]);
+    return Boolean(payload?.flags.includes("ADMIN"));
+  }
+
   app.get(
     "/ws",
     {
@@ -3513,10 +3554,31 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       // Bounds *connection attempts* per IP, not concurrent connections or
       // anything that happens over an already-open socket (that's the
       // per-message limiters in rateLimiter.ts, applied inside the message
-      // handler below). 30/min comfortably covers a real client's
+      // handler below). WS_UPGRADE_MAX comfortably covers a real client's
       // reconnect/backoff behavior (network blips, sleep/wake, page
       // reloads) while still bounding a connection-flood attempt.
-      config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+      //
+      // A verified moderator is charged against ADMIN_WS_UPGRADE_MAX
+      // instead, in its own keyspace, because the camera wall legitimately
+      // opens one socket *per room it watches* — it was blowing through the
+      // anonymous ceiling in about ten seconds, and the failed rooms' own
+      // reconnect backoff then kept the bucket permanently empty, so those
+      // rooms sat on "sem conexão" indefinitely while opening any one of
+      // them by hand (a single socket) worked fine.
+      //
+      // Separate keys, not just a bigger number for the same one: sharing a
+      // bucket would let the wall starve the moderator's ordinary browsing
+      // of the same site, and would let an anonymous flood from a NAT the
+      // moderator sits behind eat the wall's budget.
+      config: {
+        rateLimit: {
+          max: (request: FastifyRequest) =>
+            isAdminUpgrade(request) ? ADMIN_WS_UPGRADE_MAX : WS_UPGRADE_MAX,
+          keyGenerator: (request: FastifyRequest) =>
+            isAdminUpgrade(request) ? `admin:${request.ip}` : request.ip,
+          timeWindow: "1 minute",
+        },
+      },
     },
     (socket: WebSocket, request: FastifyRequest) => {
     const ip = request.ip;
