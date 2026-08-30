@@ -516,12 +516,53 @@ export interface RoomVideoSource {
   updatedAt: number;
 }
 
+// The room's music. Same "nothing streams, only this record travels" model
+// as RoomVideoSource above, and the same server clock behind the position
+// arithmetic — but a different thing socially, which is why it is a field of
+// its own rather than a fifth video source:
+//
+//   - There is exactly one. A room has *a* soundtrack; a second one playing
+//     over it is not a feature. Adding replaces whatever was there.
+//   - Only the room's owner and admins add, replace, remove or steer it.
+//     Everyone else listens. A video source is something a participant
+//     brings to the room; music is something the room *has*, and a stranger
+//     changing the song for everyone is the failure mode to design out.
+//   - It plays audio-only, in a bar rather than a tile (see the client's
+//     MusicBar), so it never competes with what people are actually watching.
+interface RoomMusicSource {
+  id: string;
+  // Only YouTube for now — its IFrame API is the one that gives a room both
+  // full transport control and a position to synchronize on. See the client's
+  // musicSource.ts for why Spotify/Deezer embeds don't currently qualify.
+  kind: "youtube";
+  // The 11-character video id, or the playlist id when a playlist URL was
+  // pasted with no `v=` — exactly as RoomVideoSource.videoId works.
+  videoId: string;
+  playlistId?: string;
+  playlistIndex?: number;
+  // Whoever put it on, for the "colocada por" line. Not a permission: control
+  // follows the room's owner/admin list (see isRoomManager), so an admin who
+  // did not add it can still skip a track, and someone demoted stops being
+  // able to steer what they added.
+  addedById: string;
+  addedByName: string;
+  playing: boolean;
+  playbackRate: number;
+  positionSeconds: number;
+  // This server's clock, so everyone extrapolates from the same origin.
+  updatedAt: number;
+}
+
 interface RoomInfo extends RoomRecord {
   sockets: Set<WebSocket>;
   createdAt: number;
   messages: ChatMessage[];
   // See RoomVideoSource. Capped at MAX_ROOM_VIDEO_SOURCES.
   videoSources: RoomVideoSource[];
+  // The room's one music source, or null when it has none. In-memory and
+  // room-scoped like videoSources — a soundtrack belongs to a room while the
+  // room exists, and is not something to restore days later from a record.
+  music: RoomMusicSource | null;
   // Room-scoped display-name reservations — separate from any other room,
   // so the same name can be used freely in two different rooms at once (see
   // isSameOwner and the "join"/"register" handlers). Keyed the same way the
@@ -884,6 +925,17 @@ const roomDeletionTimers = new Map<string, NodeJS.Timeout>();
 // covers a reload/brief network drop; only if the room is still empty once
 // it elapses do we actually tear it down.
 const ROOM_DELETION_GRACE_MS = 20_000;
+// Pending "the owner left — hand the room over unless they come back"
+// timers, keyed by room. See scheduleOwnershipHandover.
+const roomOwnershipTimers = new Map<string, NodeJS.Timeout>();
+// How long a room keeps its owner after they disappear. An owner dropping
+// out is very often a reload, a tunnel, a laptop lid, or a phone switching
+// from wifi to mobile data — and handing their room to somebody else the
+// instant that happens means they come back thirty seconds later as an
+// ordinary participant, unable to manage the room they created. Three
+// minutes is long enough to cover all of that and short enough that a room
+// whose owner really has gone for the night isn't left unmanageable.
+const OWNERSHIP_HANDOVER_GRACE_MS = 3 * 60_000;
 // Single site-wide banner, independent of any room — broadcastToAll below
 // pushes it to every open socket regardless of what room (if any) they're
 // in, and a fresh connection gets whatever's currently active appended
@@ -1350,6 +1402,7 @@ function publishRoomCreated(room: string, roomInfo: RoomInfo): void {
     createdAt: roomInfo.createdAt,
     messages: roomInfo.messages,
     videoSources: roomInfo.videoSources,
+    music: roomInfo.music,
   });
 }
 
@@ -1359,6 +1412,10 @@ function publishRoomRecord(room: string, roomInfo: RoomInfo): void {
 
 function publishRoomVideoSources(room: string, roomInfo: RoomInfo): void {
   clusterEvent("room:video", { room, videoSources: roomInfo.videoSources });
+}
+
+function publishRoomMusic(room: string, roomInfo: RoomInfo): void {
+  clusterEvent("room:music", { room, music: roomInfo.music });
 }
 
 function publishRoomChat(room: string, message: ChatMessage): void {
@@ -1476,12 +1533,14 @@ if (CLUSTER_ENABLED) {
       createdAt,
       messages,
       videoSources,
+      music,
     }: {
       room: string;
       record: RoomRecord;
       createdAt: number;
       messages: ChatMessage[];
       videoSources: RoomVideoSource[];
+      music?: RoomMusicSource | null;
     }) => {
       const existing = rooms.get(room);
       if (!existing) {
@@ -1491,6 +1550,7 @@ if (CLUSTER_ENABLED) {
           messages,
           names: new Map(),
           videoSources,
+          music: music ?? null,
           ...record,
         });
         return;
@@ -1518,6 +1578,11 @@ if (CLUSTER_ENABLED) {
     if (roomInfo) roomInfo.videoSources = videoSources;
   });
 
+  onBus("room:music", ({ room, music }: { room: string; music: RoomMusicSource | null }) => {
+    const roomInfo = rooms.get(room);
+    if (roomInfo) roomInfo.music = music;
+  });
+
   onBus("room:chat", ({ room, message }: { room: string; message: ChatMessage }) => {
     const roomInfo = rooms.get(room);
     if (!roomInfo) return;
@@ -1529,6 +1594,7 @@ if (CLUSTER_ENABLED) {
 
   onBus("room:remove", ({ room }: { room: string }) => {
     clearRoomDeletionTimer(room);
+    clearOwnershipHandoverTimer(room);
     rooms.delete(room);
   });
 
@@ -1710,6 +1776,7 @@ interface ClusterStateDump {
     createdAt: number;
     messages: ChatMessage[];
     videoSources: RoomVideoSource[];
+    music: RoomMusicSource | null;
     // connKeys rather than snapshots: every client involved is already in
     // `clients` above, which is applied first.
     members: string[];
@@ -1733,6 +1800,7 @@ function buildClusterStateDump(): ClusterStateDump {
       createdAt: roomInfo.createdAt,
       messages: roomInfo.messages,
       videoSources: roomInfo.videoSources,
+      music: roomInfo.music,
       members: [...roomInfo.sockets]
         .map((s) => clients.get(s)?.connKey)
         .filter((k): k is string => k !== undefined),
@@ -1784,6 +1852,7 @@ function applyClusterStateDump(dump: ClusterStateDump): void {
         messages: entry.messages,
         names: new Map(),
         videoSources: entry.videoSources,
+        music: entry.music ?? null,
         ...entry.record,
       };
       rooms.set(entry.room, roomInfo);
@@ -2384,6 +2453,8 @@ function scheduleRoomDeletion(room: string) {
     try {
       const roomInfo = rooms.get(room);
       if (roomInfo && roomInfo.sockets.size === 0) {
+        // Nothing left to hand to anyone.
+        clearOwnershipHandoverTimer(room);
         rooms.delete(room);
         publishRoomRemoved(room);
         deletePersistedChat(room).catch((err) => {
@@ -2398,6 +2469,91 @@ function scheduleRoomDeletion(room: string) {
     }
   }, ROOM_DELETION_GRACE_MS);
   roomDeletionTimers.set(room, timer);
+}
+
+function clearOwnershipHandoverTimer(room: string) {
+  const timer = roomOwnershipTimers.get(room);
+  if (timer) {
+    clearTimeout(timer);
+    roomOwnershipTimers.delete(room);
+  }
+}
+
+// Whether `userId` has a live connection in this room right now. A
+// moderator's admin-join ghost doesn't count as anybody being present — it is
+// watching the room, not in it.
+function isPresentInRoom(roomInfo: RoomInfo, userId: string): boolean {
+  for (const sock of roomInfo.sockets) {
+    const client = clients.get(sock);
+    if (client && !client.isModerator && stableUserId(client) === userId) return true;
+  }
+  return false;
+}
+
+// Hands the room to whoever's been here longest of who's left.
+// `sockets` is a Set, which preserves insertion order, so its first
+// remaining entry is exactly that (modulo a reconnect re-inserting someone at
+// the back — an accepted approximation, same spirit as isSameOwner's
+// guest-identity heuristics elsewhere in this file).
+//
+// An admin the departing owner promoted comes first, ahead of plain
+// seniority: promoting someone is the owner already having said who they
+// trust to run the place, so handing the room to a stranger who merely
+// arrived earlier would throw that away. Falls back to the longest-present
+// member when no admin is left.
+//
+// The result is persisted rather than recomputed: one extra Redis write for
+// an event this rare (an owner really leaving a room that still has people in
+// it) is nothing next to what it would cost to work this out on every join.
+function handOverRoomOwnership(room: string, roomInfo: RoomInfo): void {
+  const remaining = [...roomInfo.sockets]
+    .map((sock) => clients.get(sock))
+    .filter((c): c is ClientInfo => c !== undefined && !c.isModerator);
+  const nextOwner =
+    remaining.find((c) => roomInfo.admins.some((a) => a.id === stableUserId(c))) ?? remaining[0];
+  if (!nextOwner) return;
+  roomInfo.ownerId = stableUserId(nextOwner);
+  // No point listing the owner among the people the owner promoted —
+  // isRoomManager already covers them, and the management UI would otherwise
+  // offer to "demote" the person who runs the room.
+  roomInfo.admins = roomInfo.admins.filter((a) => a.id !== roomInfo.ownerId);
+  persistRoomRecord(room, roomInfo);
+  publishRoomRecord(room, roomInfo);
+  broadcastToRoom(room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+}
+
+// The owner has left a room that still has people in it. Rather than handing
+// it over on the spot, wait OWNERSHIP_HANDOVER_GRACE_MS and check again:
+// most owners who vanish are back well inside that window, and taking their
+// room away for a reload is a worse failure than a few minutes without a
+// manager present.
+//
+// The decision is made when the timer *fires*, not when it is set — by then
+// the owner is either back (in which case nothing happens) or genuinely gone,
+// and whoever gets the room is chosen from who is actually there at that
+// moment rather than from who happened to be there when the owner dropped.
+//
+// Per-process, like scheduleRoomDeletion: the worker holding the timer is the
+// one that saw the owner go. It doesn't need to be the one that sees them
+// come back, though — room membership is replicated (see the "room:member"
+// bus event), so the presence check below reads the whole cluster's answer
+// even on a worker the owner never reconnected to.
+function scheduleOwnershipHandover(room: string) {
+  clearOwnershipHandoverTimer(room);
+  const timer = setTimeout(() => {
+    roomOwnershipTimers.delete(room);
+    try {
+      const roomInfo = rooms.get(room);
+      // Gone, emptied out, or the owner came back — all three mean there is
+      // nothing to hand over.
+      if (!roomInfo || roomInfo.sockets.size === 0) return;
+      if (roomInfo.ownerId && isPresentInRoom(roomInfo, roomInfo.ownerId)) return;
+      handOverRoomOwnership(room, roomInfo);
+    } catch (err) {
+      console.error(`[room-ownership] Falha ao transferir a posse da sala "${room}":`, err);
+    }
+  }, OWNERSHIP_HANDOVER_GRACE_MS);
+  roomOwnershipTimers.set(room, timer);
 }
 
 // Whole seconds elapsed since `start` (ms since epoch) — never negative,
@@ -2453,38 +2609,17 @@ function leaveRoom(info: ClientInfo) {
       // deliberately does NOT delete the file either, since that's not a
       // real departure — see detachSession's comment.)
       scheduleRoomDeletion(room);
-    } else if (roomInfo.ownerId === stableUserId(info)) {
-      // The owner left but the room isn't empty — hand ownership to
-      // whoever's been here longest of who's left. `sockets` is a Set,
-      // which preserves insertion order, so its first remaining entry is
-      // exactly that (modulo a reconnect re-inserting someone at the back —
-      // an accepted approximation, same spirit as isSameOwner's
-      // guest-identity heuristics elsewhere in this file). One extra Redis
-      // write for an event this rare (an owner actually leaving a room that
-      // still has people in it) is nothing next to what it'd cost to do
-      // this on every join instead.
-      //
-      // An admin the departing owner promoted comes first, ahead of plain
-      // seniority: promoting someone is the owner already having said who
-      // they trust to run the place, so handing the room to a stranger who
-      // merely arrived earlier would throw that away. Falls back to the
-      // longest-present member when no admin is left.
-      const remaining = [...roomInfo.sockets]
-        .map((sock) => clients.get(sock))
-        .filter((c): c is ClientInfo => c !== undefined && !c.isModerator);
-      const nextOwner =
-        remaining.find((c) => roomInfo.admins.some((a) => a.id === stableUserId(c))) ??
-        remaining[0];
-      if (nextOwner) {
-        roomInfo.ownerId = stableUserId(nextOwner);
-        // No point listing the owner among the people the owner promoted —
-        // isRoomManager already covers them, and the management UI would
-        // otherwise offer to "demote" the person who runs the room.
-        roomInfo.admins = roomInfo.admins.filter((a) => a.id !== roomInfo.ownerId);
-        persistRoomRecord(room, roomInfo);
-        publishRoomRecord(room, roomInfo);
-        broadcastToRoom(room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
-      }
+    } else if (
+      roomInfo.ownerId === stableUserId(info) &&
+      // Only when their *last* connection to this room is gone. Closing one
+      // of two tabs is not leaving, and without this an owner with a second
+      // tab open could lose the room to an admin who happens to rank ahead
+      // of them in handOverRoomOwnership.
+      !isPresentInRoom(roomInfo, roomInfo.ownerId)
+    ) {
+      // Not handed over here — see scheduleOwnershipHandover, which waits to
+      // see whether the owner is actually gone or merely reloading.
+      scheduleOwnershipHandover(room);
     }
   }
   // A video source belongs to whoever added it — they're the only one who
@@ -4119,6 +4254,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
                 messages,
                 names: new Map(),
                 videoSources: [],
+                music: null,
                 ...record,
               };
               rooms.set(room, roomInfo);
@@ -4137,6 +4273,12 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           // longer trying to join.
           if (info.room !== room || !clients.has(socket)) return;
           roomInfo.sockets.add(socket);
+          // The owner is back inside the grace period (see
+          // scheduleOwnershipHandover) — the timer's own presence check would
+          // reach the same answer when it fires, but there is no reason to
+          // leave a pending handover armed against someone who is standing
+          // right here.
+          if (roomInfo.ownerId === stableUserId(info)) clearOwnershipHandoverTimer(room);
           roomInfo.names.set(nameKey, socket);
           publishRoomMember(room, info, true);
           publishRoomName(room, nameKey, info);
@@ -4160,6 +4302,11 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             peers,
             messages: roomInfo.messages,
             videoSources: roomInfo.videoSources,
+            // The room's soundtrack, if it has one (see RoomMusicSource) —
+            // folded into the join answer like everything else, so someone
+            // arriving mid-song starts at the right second instead of at
+            // whatever the next transport message happens to say.
+            music: roomInfo.music,
             // Who runs this room and what it currently allows (see
             // roomSettingsPayload) — folded into the join answer rather than
             // pushed separately, so the UI never renders a frame where it
@@ -4657,6 +4804,126 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             updatedAt: source.updatedAt,
             ...(typeof source.playlistIndex === "number"
               ? { playlistIndex: source.playlistIndex }
+              : {}),
+          });
+          break;
+        }
+        // The room's music (see RoomMusicSource) — three messages mirroring
+        // the video-source ones above, minus everything that only makes
+        // sense when a room can hold several: there is one, setting replaces
+        // it, and control follows the room's owner/admin list rather than
+        // whoever happened to add it.
+        //
+        // Two gates, both enforced here rather than only in the UI. A room
+        // manager, because this is one shared output for the whole room. And
+        // a real account (`info.accountId`), because a guest identity lasts
+        // as long as a browser profile does — putting the room's soundtrack
+        // behind a name that can be discarded and remade at will is how a
+        // banned visitor comes straight back to the decks.
+        case "music-set": {
+          if (!info.room || !info.name) return;
+          if (!(await consumeRateLimit(wsVideoSourceLimiter, info.rateLimitKey, "video-source"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (!isRoomManager(roomInfo, info)) {
+            send(socket, {
+              type: "error",
+              message: "Só o dono e os administradores da sala podem colocar música.",
+            });
+            return;
+          }
+          if (!info.accountId) {
+            send(socket, {
+              type: "error",
+              message: "Entre com uma conta do site para colocar música na sala.",
+            });
+            return;
+          }
+          // YouTube only, and re-parsed here rather than trusted: the id in
+          // this record is what every listener's iframe loads, so it must
+          // never be something a client typed.
+          if (msg.kind !== "youtube") {
+            send(socket, { type: "error", message: "Plataforma de música inválida." });
+            return;
+          }
+          const rawUrl = typeof msg.url === "string" ? msg.url : "";
+          const parsed = parseYouTubeSource(rawUrl);
+          const videoId = parsed ? parsed.videoId || parsed.playlistId : null;
+          if (!videoId) {
+            send(socket, { type: "error", message: "Link do YouTube inválido." });
+            return;
+          }
+          roomInfo.music = {
+            id: genId(),
+            kind: "youtube",
+            videoId,
+            ...(parsed?.playlistId ? { playlistId: parsed.playlistId } : {}),
+            addedById: stableUserId(info),
+            addedByName: info.name,
+            // Starts playing, same reasoning as a video source: putting
+            // music on and then having to press play is a step nobody meant
+            // to ask for.
+            playing: true,
+            playbackRate: 1,
+            positionSeconds: 0,
+            updatedAt: Date.now(),
+          };
+          publishRoomMusic(info.room, roomInfo);
+          broadcastToRoom(info.room, { type: "music", music: roomInfo.music });
+          break;
+        }
+        case "music-clear": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsVideoSourceLimiter, info.rateLimitKey, "video-source"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (!isRoomManager(roomInfo, info)) return;
+          if (!roomInfo.music) return;
+          roomInfo.music = null;
+          publishRoomMusic(info.room, roomInfo);
+          broadcastToRoom(info.room, { type: "music", music: null });
+          break;
+        }
+        // Play/pause/seek/skip. Ignored silently for anyone who isn't a
+        // manager: a client honoring the same rule is already blocked from
+        // reaching this, so anything that does arrive is not an honest
+        // mistake worth answering.
+        case "music-state": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsVideoSourceLimiter, info.rateLimitKey, "video-source"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          const music = roomInfo.music;
+          if (!music) return;
+          if (!isRoomManager(roomInfo, info)) return;
+          // Addressed at the source this client believes it is steering — a
+          // transport message that raced a replacement must not be applied
+          // to the song that took its place.
+          if (typeof msg.id === "string" && msg.id !== music.id) return;
+          const rawPosition = typeof msg.positionSeconds === "number" ? msg.positionSeconds : NaN;
+          music.positionSeconds =
+            Number.isFinite(rawPosition) && rawPosition > 0 ? Math.min(rawPosition, 24 * 60 * 60) : 0;
+          music.playing = Boolean(msg.playing);
+          if (hasOwn(msg, "playbackRate")) {
+            music.playbackRate = normalizePlaybackRate(msg.playbackRate);
+          }
+          if (hasOwn(msg, "playlistIndex")) {
+            const rawIndex = typeof msg.playlistIndex === "number" ? msg.playlistIndex : NaN;
+            if (Number.isFinite(rawIndex) && rawIndex >= 0) {
+              music.playlistIndex = Math.min(Math.floor(rawIndex), 10_000);
+            }
+          }
+          music.updatedAt = Date.now();
+          publishRoomMusic(info.room, roomInfo);
+          broadcastToRoom(info.room, {
+            type: "music-state",
+            id: music.id,
+            playing: music.playing,
+            positionSeconds: music.positionSeconds,
+            playbackRate: music.playbackRate,
+            updatedAt: music.updatedAt,
+            ...(typeof music.playlistIndex === "number"
+              ? { playlistIndex: music.playlistIndex }
               : {}),
           });
           break;
