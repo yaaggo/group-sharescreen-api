@@ -31,6 +31,7 @@ import {
   refreshAccountFromMongo,
   getAccountConnections,
   isNameReserved,
+  isUsernameTaken,
   getPublicAccountById,
   addAccountPoints,
   addAccountCallStats,
@@ -3161,6 +3162,40 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
   // adminAuth.ts) — it's just an account whose flags include "ADMIN" (see
   // accountStore.ts's initAccountStore bootstrap), checked identically to
   // every other route below via requireAdmin.
+  // Is this username free? Asked as somebody types, which is the whole point:
+  // before this existed, the only way to find out was to submit the signup
+  // form and read the error — so finding a free username meant five, ten,
+  // fifteen POSTs to /auth/register, which is exactly the shape the rate
+  // limiter and the auto-ban are built to stop. People were being banned for
+  // trying to sign up.
+  //
+  // Cheap enough to be asked freely: it is one lookup in the same in-memory
+  // index every login goes through (see isUsernameTaken), no database round
+  // trip and no password hashing — which is why the budget here is generous
+  // where /auth/register's is deliberately tight.
+  //
+  // It does let someone enumerate which usernames exist. That is already true
+  // of every site with public profiles, and this one has them at /user/:id —
+  // a username is a public handle, not a secret, and the alternative on offer
+  // was banning real people for typing.
+  app.get(
+    "/auth/username-available",
+    { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+    async (request) => {
+      const raw = (request.query as { username?: unknown } | undefined)?.username;
+      const username = (typeof raw === "string" ? raw.trim() : "").toLowerCase();
+      if (!USERNAME_RE.test(username)) {
+        return {
+          username,
+          valid: false,
+          available: false,
+          error: "Use 3 a 20 letras, números ou _.",
+        };
+      }
+      return { username, valid: true, available: !isUsernameTaken(username) };
+    }
+  );
+
   // Account creation — cheap to abuse into a spam/enumeration tool if left
   // uncapped (each attempt tries a password hash + a uniqueness check), and
   // nobody legitimately creates more than a couple of accounts per IP in a
