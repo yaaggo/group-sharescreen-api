@@ -4728,6 +4728,8 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           const userId = typeof msg.userId === "string" ? msg.userId : "";
           if (!userId || userId === roomInfo.ownerId) return;
           if (roomInfo.admins.some((a) => a.id === userId)) return;
+          if (roomInfo.bannedMembers.some((b) => b.id === userId)) return;
+          if (roomInfo.mutedMembers.includes(userId)) return;
           if (roomInfo.admins.length >= MAX_ROOM_ADMINS) {
             send(socket, {
               type: "error",
