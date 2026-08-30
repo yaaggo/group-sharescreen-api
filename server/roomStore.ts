@@ -79,6 +79,78 @@ export function normalizeRoomAdmins(raw: unknown): RoomAdmin[] {
   return out;
 }
 
+// Somebody the room's owner or admins threw out for good (see signaling.ts's
+// "room-ban"). Room-scoped and nothing to do with the site-wide bans in
+// moderationStore.ts: this one is a room saying who is not welcome in it, not
+// the site saying who is not welcome at all, and it is issued by people who
+// run one room rather than by moderators.
+//
+// A ban records every handle the room had on that person at the time, and a
+// join is refused when *any* of them matches. One alone is too easy to shed:
+// a guest id goes with the browser's site data, a name is retyped, an address
+// changes on its own for anyone on mobile data.
+//
+// What each one is worth, and what it costs:
+//
+//   - `accountId` is the strong one. An account cannot be discarded and
+//     remade for free, so a banned account stays banned.
+//   - `id` (the stableUserId) is the account id when there is one and the
+//     guest id otherwise — the handle everything else in the room is keyed on,
+//     and what unbanning addresses.
+//   - `guestName` catches "cleared my data, came back as the same person",
+//     which is the common way a guest ban is walked around. Only ever recorded
+//     for a guest, and it is the blunt one: someone else who later picks that
+//     name in this room is caught by it too. Acceptable for a room-scoped ban
+//     the host can lift, and not something to do site-wide.
+//   - `ip` catches the same evasion when the name changes too. Kept on the
+//     server and never sent to a client — a room's host has no business
+//     reading their members' addresses, and the ban works without them seeing
+//     it. It is also the weakest: shared by everyone behind one CGNAT, and
+//     replaced on its own for anyone on mobile data.
+export interface RoomBan {
+  id: string;
+  // Their display name when they were banned, so the list can name someone
+  // who is (by construction) not in the room to be named by the peer list.
+  name: string;
+  bannedAt: number;
+  accountId?: string | null;
+  guestName?: string | null;
+  // Server-side only — see the note above. Never included in what is sent to
+  // the room's managers (see signaling.ts's publicRoomBan).
+  ip?: string | null;
+}
+
+// Same defensive read, and same de-duplication, as normalizeRoomAdmins.
+export function normalizeRoomBans(raw: unknown): RoomBan[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const out: RoomBan[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const { id, name, bannedAt } = entry as {
+      id?: unknown;
+      name?: unknown;
+      bannedAt?: unknown;
+    };
+    if (typeof id !== "string" || !id || seen.has(id)) continue;
+    seen.add(id);
+    const { accountId, guestName, ip } = entry as {
+      accountId?: unknown;
+      guestName?: unknown;
+      ip?: unknown;
+    };
+    out.push({
+      id,
+      name: typeof name === "string" ? name : "",
+      bannedAt: typeof bannedAt === "number" && Number.isFinite(bannedAt) ? bannedAt : 0,
+      accountId: typeof accountId === "string" ? accountId : null,
+      guestName: typeof guestName === "string" ? guestName : null,
+      ip: typeof ip === "string" ? ip : null,
+    });
+  }
+  return out;
+}
+
 // Where on Earth the room's owner/admins put it, for the public room map
 // (see the client's /mapa). Null for a room nobody has placed — which is
 // every room until someone does, and the only state a private room is ever
@@ -170,6 +242,10 @@ export interface RoomRecord {
   // what gives a room persisted before they existed sane starting values
   // without a backfill migration.
   admins: RoomAdmin[];
+  // See RoomBan. Persisted with the room, like `admins`, so a ban outlives the
+  // room emptying out — a ban that expired the moment the last person left
+  // would be no ban at all.
+  bans: RoomBan[];
   permissions: RoomPermissions;
   // "" and null when nobody has set them — see the two normalizers above.
   description: string;
@@ -191,6 +267,7 @@ function normalizeRoomRecord(raw: unknown): RoomRecord | null {
     flags: Array.isArray(record.flags) ? record.flags.filter((f) => typeof f === "string") : [],
     code: typeof record.code === "string" ? record.code : null,
     admins: normalizeRoomAdmins(record.admins),
+    bans: normalizeRoomBans(record.bans),
     permissions: normalizeRoomPermissions(record.permissions),
     location: normalizeRoomLocation(record.location),
     description: normalizeRoomDescription(record.description),

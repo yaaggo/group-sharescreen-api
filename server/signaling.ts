@@ -54,6 +54,7 @@ import {
   DEFAULT_ROOM_PERMISSIONS,
   type RoomRecord,
   type RoomAdmin,
+  type RoomBan,
   type RoomPermissions,
 } from "./roomStore.js";
 import {
@@ -686,6 +687,7 @@ function roomSettingsPayload(roomInfo: RoomInfo) {
   return {
     ownerId: roomInfo.ownerId,
     admins: roomInfo.admins,
+    bans: roomInfo.bans,
     permissions: roomInfo.permissions,
     location: roomInfo.location,
     description: roomInfo.description,
@@ -704,6 +706,7 @@ function persistRoomRecord(room: string, roomInfo: RoomInfo): void {
     flags: roomInfo.flags,
     code: roomInfo.code,
     admins: roomInfo.admins,
+    bans: roomInfo.bans,
     permissions: roomInfo.permissions,
     location: roomInfo.location,
     description: roomInfo.description,
@@ -1431,6 +1434,7 @@ function roomRecordOf(roomInfo: RoomInfo): RoomRecord {
     flags: roomInfo.flags,
     code: roomInfo.code,
     admins: roomInfo.admins,
+    bans: roomInfo.bans,
     permissions: roomInfo.permissions,
     location: roomInfo.location,
     description: roomInfo.description,
@@ -2687,6 +2691,42 @@ function flushClientStats(info: ClientInfo) {
   if (info.accountId && (delta.callSeconds || delta.micSeconds || delta.shareSeconds)) {
     void addAccountCallStats(info.accountId, delta);
   }
+}
+
+// What a ban looks like to the room's managers: everything except the address
+// it also matches on. A room's host can ban somebody without being handed
+// their members' IPs, and the ban works exactly as well either way — see
+// RoomBan in roomStore.ts.
+function publicRoomBan(ban: RoomBan) {
+  return { id: ban.id, name: ban.name, bannedAt: ban.bannedAt };
+}
+
+// Pushes the ban list to everyone in the room who is allowed to see it, and
+// to nobody else. Separate from roomSettingsPayload for exactly that reason.
+function sendRoomBansToManagers(room: string, roomInfo: RoomInfo): void {
+  for (const sock of roomInfo.sockets) {
+    const client = clients.get(sock);
+    if (client && isRoomManager(roomInfo, client)) {
+      send(sock, { type: "room-bans", bans: roomInfo.bans.map(publicRoomBan) });
+    }
+  }
+}
+
+// Whether this connection is one of the people a room threw out. Any handle
+// matching is enough — see RoomBan for what each is worth. The guest-name
+// check is deliberately guest-only: an account's display name is not what its
+// ban is keyed on, and catching an account by a name somebody else was banned
+// under would be a false positive with a real person behind it.
+function matchesRoomBan(bans: RoomBan[], info: ClientInfo): boolean {
+  const userId = stableUserId(info);
+  const guestName = info.accountId ? null : info.name?.trim().toLowerCase();
+  return bans.some(
+    (ban) =>
+      ban.id === userId ||
+      (Boolean(ban.accountId) && ban.accountId === info.accountId) ||
+      (Boolean(ban.ip) && ban.ip === info.ip) ||
+      (Boolean(guestName) && Boolean(ban.guestName) && ban.guestName === guestName)
+  );
 }
 
 function leaveRoom(info: ClientInfo) {
@@ -4287,6 +4327,22 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             }
           }
 
+          // Thrown out of this room for good (see "room-ban"). Checked against
+          // the *persisted* record as well as the live one, because a room that
+          // emptied out and came back is the same room to everybody except its
+          // memory — and a ban that lapsed while nobody was in it would be a
+          // ban you wait out by waiting.
+          const existingBans =
+            rooms.get(room)?.bans ?? (await loadRoomRecord(room))?.bans ?? [];
+          if (matchesRoomBan(existingBans, info)) {
+            send(socket, {
+              type: "join-error",
+              message: "Você foi banido desta sala.",
+              banned: true,
+            });
+            return;
+          }
+
           if (info.room) leaveRoom(info);
           clearRoomDeletionTimer(room);
           info.room = room;
@@ -4342,6 +4398,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
                 // every action wide open — see roomStore.ts's
                 // DEFAULT_ROOM_PERMISSIONS.
                 admins: [],
+                bans: [],
                 permissions: { ...DEFAULT_ROOM_PERMISSIONS },
                 // Unplaced and undescribed until someone says otherwise —
                 // see "room-location-set" and "room-info-set".
@@ -4771,6 +4828,102 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           persistRoomRecord(info.room, roomInfo);
           publishRoomRecord(info.room, roomInfo);
           broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+          break;
+        }
+        // Throwing somebody out of the room, for now or for good. Both are
+        // the room's own moderation — nothing to do with the site-wide bans in
+        // moderationStore.ts, which are a moderator's tool and reach across
+        // every room at once.
+        //
+        // Owner and admins both, because moderating is what admins are for.
+        // With two limits that keep the power from turning on the room itself:
+        // nobody may throw out the owner, and only the owner may throw out an
+        // admin. Without the second, one admin could clear the bench of the
+        // others and leave the owner alone among strangers.
+        case "room-kick":
+        case "room-ban": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsVideoSourceLimiter, info.rateLimitKey, "video-source"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (!isRoomManager(roomInfo, info)) return;
+          const targetId = typeof msg.userId === "string" ? msg.userId : "";
+          if (!targetId || targetId === stableUserId(info)) return;
+          if (targetId === roomInfo.ownerId) return;
+          const targetIsAdmin = roomInfo.admins.some((a) => a.id === targetId);
+          if (targetIsAdmin && !isRoomOwner(roomInfo, info)) return;
+
+          // Every connection that identity has in this room — a second tab is
+          // the obvious way to walk straight back in otherwise.
+          const targets = [...roomInfo.sockets]
+            .map((sock) => clients.get(sock))
+            .filter((c): c is ClientInfo => c !== undefined && stableUserId(c) === targetId);
+
+          if (msg.type === "room-ban") {
+            const target = targets[0];
+            const name = target?.name ?? targetId;
+            if (!roomInfo.bans.some((b) => b.id === targetId)) {
+              // Every handle the room has on them right now. Whatever is
+              // unknown (they already left, so there is no live connection to
+              // read an address off) is simply absent — the ban still holds on
+              // the id, which is the one that is always there.
+              roomInfo.bans = [
+                ...roomInfo.bans,
+                {
+                  id: targetId,
+                  name,
+                  bannedAt: Date.now(),
+                  accountId: target?.accountId ?? null,
+                  guestName: target && !target.accountId ? (target.name?.trim().toLowerCase() ?? null) : null,
+                  ip: target?.ip ?? null,
+                },
+              ];
+            }
+            // A banned admin stops being one: coming back as a manager the
+            // moment somebody unbans them is not what banning meant.
+            roomInfo.admins = roomInfo.admins.filter((a) => a.id !== targetId);
+            persistRoomRecord(info.room, roomInfo);
+            publishRoomRecord(info.room, roomInfo);
+            broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+            sendRoomBansToManagers(info.room, roomInfo);
+          }
+
+          for (const target of targets) {
+            // Told before being removed, so their client can say what happened
+            // instead of looking like the connection dropped.
+            send(target.socket, {
+              type: "room-removed",
+              room: info.room,
+              banned: msg.type === "room-ban",
+            });
+            leaveRoom(target);
+          }
+          break;
+        }
+        // Lifting a ban. The owner's alone: an admin who could unban could
+        // undo the owner's own decisions about who is allowed in their room.
+        case "room-unban": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsVideoSourceLimiter, info.rateLimitKey, "video-source"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (!isRoomOwner(roomInfo, info)) return;
+          const targetId = typeof msg.userId === "string" ? msg.userId : "";
+          if (!roomInfo.bans.some((b) => b.id === targetId)) return;
+          roomInfo.bans = roomInfo.bans.filter((b) => b.id !== targetId);
+          persistRoomRecord(info.room, roomInfo);
+          publishRoomRecord(info.room, roomInfo);
+          sendRoomBansToManagers(info.room, roomInfo);
+          break;
+        }
+        // Who is banned is only ever sent to the people who can act on it —
+        // a list of names of people a room threw out is not something the
+        // room at large needs, and roomSettingsPayload goes to everybody.
+        case "room-bans": {
+          if (!info.room) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo || !isRoomManager(roomInfo, info)) return;
+          send(socket, { type: "room-bans", bans: roomInfo.bans.map(publicRoomBan) });
           break;
         }
         // Adding, removing and steering a room video source (see
