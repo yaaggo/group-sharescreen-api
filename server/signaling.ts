@@ -377,6 +377,12 @@ interface ClientInfo {
   // the announcer's.
   sharingFiles?: SharedFileState[];
   mic: boolean;
+  // Whether this person has silenced *everyone else's* mic for themselves
+  // ("silenciar microfones"). Purely their own listening setting — it changes
+  // nothing about what anybody transmits — but it is worth the room knowing,
+  // for the same reason a muted mic is: talking to somebody who cannot hear
+  // you is the one thing a participant list can save you from.
+  micsMuted?: boolean;
   isAlive: boolean;
   socket: WebSocket;
   // The connecting IP (see request.ip in the "/ws" handler below). Never
@@ -2437,6 +2443,7 @@ function peerSummary(info: ClientInfo) {
     // See ClientInfo.sharingFiles. Empty for anyone not playing one.
     files: info.sharingFiles ?? [],
     mic: info.mic,
+    micsMuted: info.micsMuted ?? false,
     // Not logged into a registered account — the client renders this as a
     // "(guest)" suffix wherever the name is shown (see lib/displayName.ts).
     isGuest: !info.accountId,
@@ -2799,6 +2806,7 @@ function leaveRoom(info: ClientInfo) {
   info.sharingCamera = undefined;
   info.sharingFiles = [];
   info.mic = false;
+  info.micsMuted = false;
   broadcastToRoom(room, { type: "peer-left", id: info.id }, info.socket);
 }
 
@@ -4380,6 +4388,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           info.sharingCamera = undefined;
           info.sharingFiles = [];
           info.mic = false;
+          info.micsMuted = false;
           // Starts this connection's call-time segment (see
           // flushClientStats) — never for a moderator's admin-join ghost
           // connection, which never reaches this branch anyway.
@@ -4557,6 +4566,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           info.sharingCamera = undefined;
           info.sharingFiles = [];
           info.mic = false;
+          info.micsMuted = false;
           roomInfo.sockets.add(socket);
           publishRoomMember(room, info, true);
           const adminPeers = [...roomInfo.sockets]
@@ -4686,6 +4696,21 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             screen: info.sharingScreen ?? null,
             camera: info.sharingCamera ?? null,
             files: info.sharingFiles ?? [],
+          });
+          break;
+        }
+        // "Silenciar microfones" — see ClientInfo.micsMuted. Same shape and
+        // the same budget as the mic toggle beside it, and dropped just as
+        // silently when over it: this is transient state, and the next real
+        // toggle re-announces it anyway.
+        case "mics-muted": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
+          info.micsMuted = Boolean(msg.muted);
+          broadcastToRoom(info.room, {
+            type: "peer-mics-muted",
+            id: info.id,
+            micsMuted: info.micsMuted,
           });
           break;
         }
