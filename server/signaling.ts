@@ -4926,11 +4926,14 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           const roomInfo = rooms.get(info.room);
           if (!roomInfo) return;
           if (!isRoomManager(roomInfo, info)) return;
-          const targetUserId = typeof msg.userId === "string" ? msg.userId : "";
+          const targetUserId = typeof msg.userId === "string" ? msg.userId.trim() : "";
           if (!targetUserId) return;
           if (!roomInfo.bannedMembers.some((b) => b.id === targetUserId)) return;
 
           roomInfo.bannedMembers = roomInfo.bannedMembers.filter((b) => b.id !== targetUserId);
+          if (roomInfo.kickedMembers) {
+            roomInfo.kickedMembers.delete(targetUserId);
+          }
           persistRoomRecord(info.room, roomInfo);
           publishRoomRecord(info.room, roomInfo);
           broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
