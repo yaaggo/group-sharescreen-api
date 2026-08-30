@@ -2300,6 +2300,34 @@ function realSharingCount(roomInfo: RoomInfo): number {
   return count;
 }
 
+// The two counters the public room directory shows next to peopleCount, so
+// someone browsing /rooms can tell a room where people are actually talking
+// from one where a dozen tabs sit idle. Same real-people rule as the two
+// above — a moderator's admin-join ghost is not a participant, and must not
+// inflate the numbers a stranger uses to pick a room.
+function realMicCount(roomInfo: RoomInfo): number {
+  let count = 0;
+  for (const s of roomInfo.sockets) {
+    const client = clients.get(s);
+    if (client && !client.isModerator && client.mic) count += 1;
+  }
+  return count;
+}
+
+// Screens only, not cameras: `sharingScreen` is the per-channel breakdown
+// (see ClientInfo.sharingScreen) and is what a current client reports. An
+// older client sends neither channel and only ever sets `sharing`, which is
+// exactly what that flag meant before cameras had their own channel — so it
+// falls back to it rather than counting such a peer as not sharing at all.
+function realScreenCount(roomInfo: RoomInfo): number {
+  let count = 0;
+  for (const s of roomInfo.sockets) {
+    const client = clients.get(s);
+    if (client && !client.isModerator && (client.sharingScreen ?? client.sharing)) count += 1;
+  }
+  return count;
+}
+
 // Whether `accountId` currently has a live connection in a *public* room —
 // used by GET /users/:id below to show "está numa sala pública agora"
 // (see the user profile page). Deliberately never reports a private room:
@@ -2739,6 +2767,14 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       .map(([handle, info]) => ({
         handle,
         peopleCount: realPeopleCount(info),
+        // What the room browser sorts on besides head count (see
+        // RoomsPageClient): how many people have the mic open, how many are
+        // transmitting a screen, and how many videos the room has queued up.
+        // All three are already public to anyone who joins the room, and
+        // they're what actually distinguishes a live room from an idle one.
+        micCount: realMicCount(info),
+        screenCount: realScreenCount(info),
+        videoSourceCount: info.videoSources.length,
         createdAt: info.createdAt,
         // Null for a room nobody has placed on the map yet — the map page
         // simply doesn't draw a marker for those (see the client's /mapa),
