@@ -89,6 +89,46 @@ export interface RoomLocation {
   lng: number;
 }
 
+export interface RoomBannedMember {
+  id: string;
+  name: string;
+  bannedAt: number;
+  bannedBy?: string;
+  reason?: string;
+}
+
+export function normalizeRoomBannedMembers(raw: unknown): RoomBannedMember[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const out: RoomBannedMember[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const { id, name, bannedAt, bannedBy, reason } = entry as Record<string, unknown>;
+    if (typeof id !== "string" || !id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      name: typeof name === "string" ? name : "Participante",
+      bannedAt: typeof bannedAt === "number" && Number.isFinite(bannedAt) ? bannedAt : Date.now(),
+      bannedBy: typeof bannedBy === "string" ? bannedBy : undefined,
+      reason: typeof reason === "string" ? reason.slice(0, 100) : undefined,
+    });
+  }
+  return out;
+}
+
+export function normalizeRoomMutedMembers(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const id of raw) {
+    if (typeof id !== "string" || !id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
 // Rejects anything that isn't a real point on the globe — a NaN, an Infinity,
 // a latitude past the poles — rather than letting it through to a map that
 // would then place a marker nowhere. Longitude is wrapped rather than
@@ -177,6 +217,8 @@ export interface RoomRecord {
   // See RoomLocation. Read by the public room map, and settable only by the
   // room's owner and admins (see signaling.ts's "room-location-set").
   location: RoomLocation | null;
+  bannedMembers: RoomBannedMember[];
+  mutedMembers: string[];
 }
 
 // Fills in whatever a persisted record predates, so every caller can treat
@@ -195,6 +237,8 @@ function normalizeRoomRecord(raw: unknown): RoomRecord | null {
     location: normalizeRoomLocation(record.location),
     description: normalizeRoomDescription(record.description),
     category: normalizeRoomCategory(record.category),
+    bannedMembers: normalizeRoomBannedMembers(record.bannedMembers),
+    mutedMembers: normalizeRoomMutedMembers(record.mutedMembers),
   };
 }
 

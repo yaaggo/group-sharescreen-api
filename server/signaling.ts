@@ -50,11 +50,14 @@ import {
   normalizeRoomLocation,
   normalizeRoomDescription,
   normalizeRoomCategory,
+  normalizeRoomBannedMembers,
+  normalizeRoomMutedMembers,
   ROOM_PERMISSION_KEYS,
   DEFAULT_ROOM_PERMISSIONS,
   type RoomRecord,
   type RoomAdmin,
   type RoomPermissions,
+  type RoomBannedMember,
 } from "./roomStore.js";
 import {
   loadPersistedAnnouncement,
@@ -690,6 +693,8 @@ function roomSettingsPayload(roomInfo: RoomInfo) {
     location: roomInfo.location,
     description: roomInfo.description,
     category: roomInfo.category,
+    bannedMembers: roomInfo.bannedMembers,
+    mutedMembers: roomInfo.mutedMembers,
   };
 }
 
@@ -708,6 +713,8 @@ function persistRoomRecord(room: string, roomInfo: RoomInfo): void {
     location: roomInfo.location,
     description: roomInfo.description,
     category: roomInfo.category,
+    bannedMembers: roomInfo.bannedMembers,
+    mutedMembers: roomInfo.mutedMembers,
   });
 }
 
@@ -1435,6 +1442,8 @@ function roomRecordOf(roomInfo: RoomInfo): RoomRecord {
     location: roomInfo.location,
     description: roomInfo.description,
     category: roomInfo.category,
+    bannedMembers: roomInfo.bannedMembers,
+    mutedMembers: roomInfo.mutedMembers,
   };
 }
 
@@ -4274,8 +4283,13 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           // and a stranger presenting the same name they can see in the
           // room's peer list is turned away without touching the person
           // already there.
-          const nameKey = info.name.toLowerCase();
+          const targetUserId = stableUserId(info);
           const existingRoomInfo = rooms.get(room);
+          if (existingRoomInfo && existingRoomInfo.bannedMembers?.some((b) => b.id === targetUserId)) {
+            send(socket, { type: "join-error", message: "Você foi banido desta sala pela administração." });
+            return;
+          }
+          const nameKey = info.name.toLowerCase();
           const holderSocket = existingRoomInfo?.names.get(nameKey);
           if (holderSocket && holderSocket !== socket) {
             const holder = clients.get(holderSocket);
@@ -4322,6 +4336,10 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
               loadPersistedChat(room),
               loadRoomRecord(room),
             ]);
+            if (existingRecord && existingRecord.bannedMembers?.some((b) => b.id === targetUserId)) {
+              send(socket, { type: "join-error", message: "Você foi banido desta sala pela administração." });
+              return;
+            }
             roomInfo = rooms.get(room);
             if (!roomInfo) {
               // No prior record means this join is the one creating the
@@ -4331,7 +4349,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
               // anywhere yet, just persisted).
               const isPrivate = isPrivateRoom(room);
               const record: RoomRecord = existingRecord ?? {
-                ownerId: stableUserId(info),
+                ownerId: targetUserId,
                 private: isPrivate,
                 flags: [],
                 // From the handle itself when it carries one (see
@@ -4348,6 +4366,8 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
                 location: null,
                 description: "",
                 category: null,
+                bannedMembers: [],
+                mutedMembers: [],
               };
               roomInfo = {
                 sockets: new Set(),
@@ -4367,6 +4387,10 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
               roomsCreatedTotal.inc({ visibility: isPrivateRoom(room) ? "private" : "public" });
               if (!existingRecord) void saveRoomRecord(room, record);
             }
+          }
+          if (roomInfo.bannedMembers.some((b) => b.id === targetUserId)) {
+            send(socket, { type: "join-error", message: "Você foi banido desta sala pela administração." });
+            return;
           }
           // The await above gave this socket's own "leave"/another "join"
           // a chance to run first and move it elsewhere (or the socket
@@ -4607,6 +4631,15 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
           const nextMic = Boolean(msg.mic);
           const micRoomInfo = rooms.get(info.room);
+          const callerUserId = stableUserId(info);
+          if (nextMic && micRoomInfo?.mutedMembers?.includes(callerUserId)) {
+            send(socket, {
+              type: "room-permission-denied",
+              permission: "mic",
+              message: "Você foi silenciado nesta sala pela administração.",
+            });
+            return;
+          }
           if (nextMic && micRoomInfo && !canUseRoomPermission(micRoomInfo, info, "mic")) {
             send(socket, {
               type: "room-permission-denied",
@@ -4707,6 +4740,173 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           const userId = typeof msg.userId === "string" ? msg.userId : "";
           if (!userId || !roomInfo.admins.some((a) => a.id === userId)) return;
           roomInfo.admins = roomInfo.admins.filter((a) => a.id !== userId);
+          persistRoomRecord(info.room, roomInfo);
+          publishRoomRecord(info.room, roomInfo);
+          broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+          break;
+        }
+        case "room-kick": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (!isRoomManager(roomInfo, info)) return;
+          const targetUserId = typeof msg.userId === "string" ? msg.userId : "";
+          if (!targetUserId || targetUserId === roomInfo.ownerId) return;
+          if (!isRoomOwner(roomInfo, info) && roomInfo.admins.some((a) => a.id === targetUserId)) return;
+          const callerId = stableUserId(info);
+          if (targetUserId === callerId) return;
+
+          const targets = [...roomInfo.sockets]
+            .map((s) => ({ socket: s, client: clients.get(s) }))
+            .filter(
+              (item): item is { socket: WebSocket; client: ClientInfo } =>
+                item.client !== undefined &&
+                !item.client.isModerator &&
+                stableUserId(item.client) === targetUserId
+            );
+
+          if (targets.length === 0) return;
+
+          for (const target of targets) {
+            send(target.socket, {
+              type: "room-kicked",
+              message: "Você foi expulso da sala pela administração.",
+            });
+            leaveRoom(target.client);
+          }
+          break;
+        }
+        case "room-ban": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (!isRoomManager(roomInfo, info)) return;
+          const targetUserId = typeof msg.userId === "string" ? msg.userId : "";
+          if (!targetUserId || targetUserId === roomInfo.ownerId) return;
+          if (!isRoomOwner(roomInfo, info) && roomInfo.admins.some((a) => a.id === targetUserId)) return;
+          const callerId = stableUserId(info);
+          if (targetUserId === callerId) return;
+
+          const targetInRoom = [...roomInfo.sockets]
+            .map((s) => clients.get(s))
+            .find(
+              (c): c is ClientInfo =>
+                c !== undefined && !c.isModerator && stableUserId(c) === targetUserId
+            );
+
+          const targetName =
+            (targetInRoom && targetInRoom.name) ||
+            (typeof msg.name === "string" && msg.name.trim() ? msg.name.trim() : "Participante");
+
+          const banReason =
+            typeof msg.reason === "string" ? msg.reason.trim().slice(0, 100) : undefined;
+
+          const newBanEntry: RoomBannedMember = {
+            id: targetUserId,
+            name: targetName,
+            bannedAt: Date.now(),
+            bannedBy: callerId,
+            reason: banReason,
+          };
+
+          roomInfo.bannedMembers = [
+            ...roomInfo.bannedMembers.filter((b) => b.id !== targetUserId),
+            newBanEntry,
+          ];
+
+          if (roomInfo.admins.some((a) => a.id === targetUserId)) {
+            roomInfo.admins = roomInfo.admins.filter((a) => a.id !== targetUserId);
+          }
+          if (roomInfo.mutedMembers.includes(targetUserId)) {
+            roomInfo.mutedMembers = roomInfo.mutedMembers.filter((id) => id !== targetUserId);
+          }
+
+          persistRoomRecord(info.room, roomInfo);
+          publishRoomRecord(info.room, roomInfo);
+          broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+
+          const targets = [...roomInfo.sockets]
+            .map((s) => ({ socket: s, client: clients.get(s) }))
+            .filter(
+              (item): item is { socket: WebSocket; client: ClientInfo } =>
+                item.client !== undefined &&
+                !item.client.isModerator &&
+                stableUserId(item.client) === targetUserId
+            );
+
+          for (const target of targets) {
+            send(target.socket, {
+              type: "room-banned",
+              message: "Você foi banido desta sala pela administração.",
+            });
+            leaveRoom(target.client);
+          }
+          break;
+        }
+        case "room-unban": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (!isRoomManager(roomInfo, info)) return;
+          const targetUserId = typeof msg.userId === "string" ? msg.userId : "";
+          if (!targetUserId) return;
+          if (!roomInfo.bannedMembers.some((b) => b.id === targetUserId)) return;
+
+          roomInfo.bannedMembers = roomInfo.bannedMembers.filter((b) => b.id !== targetUserId);
+          persistRoomRecord(info.room, roomInfo);
+          publishRoomRecord(info.room, roomInfo);
+          broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+          break;
+        }
+        case "room-member-mute": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (!isRoomManager(roomInfo, info)) return;
+          const targetUserId = typeof msg.userId === "string" ? msg.userId : "";
+          if (!targetUserId || targetUserId === roomInfo.ownerId) return;
+          if (!isRoomOwner(roomInfo, info) && roomInfo.admins.some((a) => a.id === targetUserId)) return;
+
+          const shouldMute = Boolean(msg.muted);
+          const alreadyMuted = roomInfo.mutedMembers.includes(targetUserId);
+          if (shouldMute === alreadyMuted) return;
+
+          const targets = [...roomInfo.sockets]
+            .map((s) => ({ socket: s, client: clients.get(s) }))
+            .filter(
+              (item): item is { socket: WebSocket; client: ClientInfo } =>
+                item.client !== undefined &&
+                !item.client.isModerator &&
+                stableUserId(item.client) === targetUserId
+            );
+
+          if (shouldMute) {
+            roomInfo.mutedMembers = [...roomInfo.mutedMembers, targetUserId];
+            for (const target of targets) {
+              if (target.client.mic) {
+                target.client.mic = false;
+                broadcastToRoom(info.room, { type: "peer-mic", id: target.client.id, mic: false });
+              }
+              send(target.socket, {
+                type: "room-member-muted",
+                muted: true,
+                message: "Você foi silenciado nesta sala pela administração.",
+              });
+            }
+          } else {
+            roomInfo.mutedMembers = roomInfo.mutedMembers.filter((id) => id !== targetUserId);
+            for (const target of targets) {
+              send(target.socket, {
+                type: "room-member-muted",
+                muted: false,
+              });
+            }
+          }
+
           persistRoomRecord(info.room, roomInfo);
           publishRoomRecord(info.room, roomInfo);
           broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
