@@ -2314,16 +2314,33 @@ function realMicCount(roomInfo: RoomInfo): number {
   return count;
 }
 
-// Screens only, not cameras: `sharingScreen` is the per-channel breakdown
-// (see ClientInfo.sharingScreen) and is what a current client reports. An
-// older client sends neither channel and only ever sets `sharing`, which is
-// exactly what that flag meant before cameras had their own channel — so it
-// falls back to it rather than counting such a peer as not sharing at all.
+// Screens and cameras are counted apart, because they are different things
+// to walk into: a room with three screens up is someone presenting, a room
+// with three cameras on is people sitting face to face. `sharingScreen` /
+// `sharingCamera` are the per-channel breakdown (see ClientInfo.sharingScreen)
+// and both are always sent together by a current client, so a peer is only
+// ever counted on the channel it actually reported — never on both.
+//
+// The screen fallback covers the one client that reports no breakdown at all:
+// an older one, which only ever sets `sharing`. That's exactly what the flag
+// meant back then — such a client predates cameras entirely and cannot be
+// broadcasting one — so reading it as a screen keeps the peer counted without
+// putting a camera in the screen tally. There is deliberately no mirror of it
+// on the camera side, where the same guess would be wrong.
 function realScreenCount(roomInfo: RoomInfo): number {
   let count = 0;
   for (const s of roomInfo.sockets) {
     const client = clients.get(s);
     if (client && !client.isModerator && (client.sharingScreen ?? client.sharing)) count += 1;
+  }
+  return count;
+}
+
+function realCameraCount(roomInfo: RoomInfo): number {
+  let count = 0;
+  for (const s of roomInfo.sockets) {
+    const client = clients.get(s);
+    if (client && !client.isModerator && client.sharingCamera) count += 1;
   }
   return count;
 }
@@ -2767,13 +2784,15 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
       .map(([handle, info]) => ({
         handle,
         peopleCount: realPeopleCount(info),
-        // What the room browser sorts on besides head count (see
-        // RoomsPageClient): how many people have the mic open, how many are
-        // transmitting a screen, and how many videos the room has queued up.
-        // All three are already public to anyone who joins the room, and
-        // they're what actually distinguishes a live room from an idle one.
+        // What the room browser shows on each card, and sorts on besides
+        // head count (see RoomsPageClient): how many people have the mic
+        // open, how many are transmitting a screen, how many have a camera
+        // on, and how many videos the room has queued up. All four are
+        // already public to anyone who joins the room, and they're what
+        // actually distinguishes a live room from an idle one.
         micCount: realMicCount(info),
         screenCount: realScreenCount(info),
+        cameraCount: realCameraCount(info),
         videoSourceCount: info.videoSources.length,
         createdAt: info.createdAt,
         // Null for a room nobody has placed on the map yet — the map page
