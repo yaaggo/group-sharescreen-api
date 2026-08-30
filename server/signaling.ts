@@ -357,6 +357,23 @@ interface ClientInfo {
   // "screen" label.
   sharingScreen?: boolean;
   sharingCamera?: boolean;
+  // The local files this connection is currently playing into the room, one
+  // per broadcast channel (see the client's localMediaSource). Empty for
+  // someone playing none.
+  //
+  // A local file has to travel as a transmission — nobody else has the file,
+  // so there is no link to embed — but it is not a screen share, and a room
+  // that cannot tell the two apart shows "fulano está compartilhando a tela"
+  // over a film. This is what lets every client label those tiles as the video
+  // sources they are, and lets a viewer's transport show a real position for a
+  // file on somebody else's machine.
+  //
+  // Descriptive, not authoritative: nothing here grants anything, and every
+  // field is capped or clamped because a client is free to send whatever it
+  // likes. The one thing the server owns is `updatedAt`, stamped on arrival,
+  // so every viewer extrapolates the position from one clock instead of from
+  // the announcer's.
+  sharingFiles?: SharedFileState[];
   mic: boolean;
   isAlive: boolean;
   socket: WebSocket;
@@ -516,6 +533,23 @@ export interface RoomVideoSource {
   updatedAt: number;
 }
 
+// One local file a connection is playing into the room — see
+// ClientInfo.sharingFiles.
+interface SharedFileState {
+  channel: string;
+  name: string;
+  // How the client that sent it presents it: "music" goes in the bar above the
+  // room, "video" takes a tile. Descriptive, like everything else here.
+  mode: "video" | "music";
+  controlMode: "owner" | "anyone";
+  playing: boolean;
+  positionSeconds: number;
+  duration: number;
+  index: number;
+  count: number;
+  updatedAt: number;
+}
+
 // The room's music. Same "nothing streams, only this record travels" model
 // as RoomVideoSource above, and the same server clock behind the position
 // arithmetic — but a different thing socially, which is why it is a field of
@@ -546,6 +580,15 @@ interface RoomMusicSource {
   // able to steer what they added.
   addedById: string;
   addedByName: string;
+  // Who may play/pause/skip it. "owner" — the default, and how music behaved
+  // before this existed — means the room's owner and admins, not just whoever
+  // put it on: an admin who did not choose the playlist can still skip a
+  // track. "anyone" opens the decks to the whole room.
+  //
+  // Note this is a different "owner" from a video source's, which really is
+  // one person. Music is something the room *has* rather than something a
+  // participant brought, so its restricted mode is the room's management.
+  controlMode: "owner" | "anyone";
   playing: boolean;
   playbackRate: number;
   positionSeconds: number;
@@ -2314,6 +2357,60 @@ function flushPendingSignals(info: ClientInfo) {
   }
 }
 
+// Claiming "só eu posso controlar" takes a source and pins it to one identity
+// for as long as it is up. That is only a promise worth making when the
+// identity behind it is one: an account is, a guest is not — a guest id lives
+// in a browser profile and is replaced by clearing site data, and the moment
+// it changes the source it owns can no longer be steered by anybody, including
+// the person who added it. So a guest's source is always open to the room.
+//
+// Enforced here and not only in the UI, like every other permission in this
+// file: a client that decided to send "owner" anyway would be handing itself
+// something the room cannot take back.
+function allowedControlMode(info: ClientInfo, requested: unknown): "owner" | "anyone" {
+  if (!info.accountId) return "anyone";
+  return requested === "anyone" ? "anyone" : "owner";
+}
+
+// At most this many at once from one person, mirroring the client's three
+// channels — a fourth could only come from a client that made it up.
+const MAX_SHARED_FILES = 3;
+
+// Everything here is client-reported, so everything here is bounded. The cap
+// on each field is what keeps a made-up announcement from turning into a
+// tile caption the length of a paragraph or a scrubber claiming a video runs
+// for a century.
+function parseSharedFiles(raw: unknown, info: ClientInfo): SharedFileState[] {
+  if (!Array.isArray(raw)) return [];
+  const now = Date.now();
+  const out: SharedFileState[] = [];
+  for (const entry of raw.slice(0, MAX_SHARED_FILES)) {
+    if (!entry || typeof entry !== "object") continue;
+    const item = entry as Record<string, unknown>;
+    const channel = typeof item.channel === "string" ? item.channel.slice(0, 16) : "";
+    const name = typeof item.name === "string" ? item.name.trim().slice(0, 120) : "";
+    if (!channel || !name) continue;
+    const clamp = (value: unknown, max: number) =>
+      typeof value === "number" && Number.isFinite(value) && value > 0
+        ? Math.min(value, max)
+        : 0;
+    out.push({
+      channel,
+      name,
+      mode: item.mode === "music" ? "music" : "video",
+      controlMode: allowedControlMode(info, item.controlMode),
+      playing: Boolean(item.playing),
+      positionSeconds: clamp(item.positionSeconds, 24 * 60 * 60),
+      duration: clamp(item.duration, 24 * 60 * 60),
+      index: Math.floor(clamp(item.index, 10_000)),
+      count: Math.floor(clamp(item.count, 10_000)),
+      // Ours, not theirs — see ClientInfo.sharingFiles.
+      updatedAt: now,
+    });
+  }
+  return out;
+}
+
 function peerSummary(info: ClientInfo) {
   return {
     id: info.id,
@@ -2322,6 +2419,8 @@ function peerSummary(info: ClientInfo) {
     // See ClientInfo.sharingScreen/sharingCamera — null when unknown.
     screen: info.sharingScreen ?? null,
     camera: info.sharingCamera ?? null,
+    // See ClientInfo.sharingFiles. Empty for anyone not playing one.
+    files: info.sharingFiles ?? [],
     mic: info.mic,
     // Not logged into a registered account — the client renders this as a
     // "(guest)" suffix wherever the name is shown (see lib/displayName.ts).
@@ -2647,6 +2746,7 @@ function leaveRoom(info: ClientInfo) {
   info.sharing = false;
   info.sharingScreen = undefined;
   info.sharingCamera = undefined;
+  info.sharingFiles = [];
   info.mic = false;
   broadcastToRoom(room, { type: "peer-left", id: info.id }, info.socket);
 }
@@ -4193,6 +4293,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           info.sharing = false;
           info.sharingScreen = undefined;
           info.sharingCamera = undefined;
+          info.sharingFiles = [];
           info.mic = false;
           // Starts this connection's call-time segment (see
           // flushClientStats) — never for a moderator's admin-join ghost
@@ -4367,6 +4468,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           info.sharing = false;
           info.sharingScreen = undefined;
           info.sharingCamera = undefined;
+          info.sharingFiles = [];
           info.mic = false;
           roomInfo.sockets.add(socket);
           publishRoomMember(room, info, true);
@@ -4433,6 +4535,13 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             typeof msg.screen === "boolean" || typeof msg.camera === "boolean";
           const wantsScreen = hasChannelBreakdown ? Boolean(msg.screen) : Boolean(msg.sharing);
           const wantsCamera = Boolean(msg.camera);
+          // The local-file channels (see ClientInfo.sharingFiles). Governed by
+          // the room's *videoSource* permission rather than a switch of their
+          // own: a file played into the room is a video source — added from the
+          // same picker, shown as the same kind of tile — and whoever turned
+          // that off meant this too.
+          const nextFiles = parseSharedFiles(msg.files, info);
+          const wantsFile = nextFiles.length > 0;
           const sharingRoomInfo = rooms.get(info.room);
           if (sharingRoomInfo) {
             const denied =
@@ -4440,7 +4549,9 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
                 ? ("screen" as const)
                 : wantsCamera && !canUseRoomPermission(sharingRoomInfo, info, "camera")
                   ? ("camera" as const)
-                  : null;
+                  : wantsFile && !canUseRoomPermission(sharingRoomInfo, info, "videoSource")
+                    ? ("videoSource" as const)
+                    : null;
             if (denied) {
               send(socket, {
                 type: "room-permission-denied",
@@ -4450,7 +4561,8 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
               return;
             }
           }
-          const nextSharing = Boolean(msg.sharing) || Boolean(msg.screen) || Boolean(msg.camera);
+          const nextSharing =
+            Boolean(msg.sharing) || Boolean(msg.screen) || Boolean(msg.camera) || wantsFile;
           // Opens/closes this connection's share-time segment (see
           // flushClientStats) — turning on starts the timer (only if it
           // wasn't already running, so a duplicate "sharing:true" is a
@@ -4467,6 +4579,10 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             }
           }
           info.sharing = nextSharing;
+          // Only meaningful while something is actually going out, and only
+          // ever as long as a tile caption needs — a client is free to send
+          // whatever it likes here, so it is capped rather than trusted.
+          info.sharingFiles = nextFiles;
           if (typeof msg.screen === "boolean" || typeof msg.camera === "boolean") {
             info.sharingScreen = Boolean(msg.screen);
             info.sharingCamera = Boolean(msg.camera);
@@ -4482,6 +4598,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             sharing: info.sharing,
             screen: info.sharingScreen ?? null,
             camera: info.sharingCamera ?? null,
+            files: info.sharingFiles ?? [],
           });
           break;
         }
@@ -4711,13 +4828,13 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             addedById: stableUserId(info),
             addedByName: info.name,
             // Twitch/Kick live embeds always show native chrome, so "only the
-            // adder steers" is unenforceable — force the wheel open.
+            // adder steers" is unenforceable — force the wheel open. A guest's
+            // is forced open too, for a different reason entirely (see
+            // allowedControlMode).
             controlMode:
               kind === "twitch" || kind === "kick"
                 ? "anyone"
-                : msg.controlMode === "anyone"
-                  ? "anyone"
-                  : "owner",
+                : allowedControlMode(info, msg.controlMode),
             // Starts playing: someone who just added a video meant to watch
             // it, and a source that arrives paused at 0 makes everyone wait
             // for whoever added it to press play again.
@@ -4748,6 +4865,38 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           roomInfo.videoSources = roomInfo.videoSources.filter((v) => v.id !== id);
           publishRoomVideoSources(info.room, roomInfo);
           broadcastToRoom(info.room, { type: "video-source-removed", id });
+          break;
+        }
+        // Changing who may drive a source that is already up. Only whoever
+        // added it decides that — the same person "video-source-remove"
+        // answers to — and it is a setting, not a playback event, so it
+        // travels on its own rather than riding video-source-state.
+        //
+        // Worth having at all because the alternative is removing the source
+        // and adding it again: everyone loses their place in it, and a
+        // playlist starts over, to change one word of configuration.
+        case "video-source-control-mode": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsVideoSourceLimiter, info.rateLimitKey, "video-source"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          const id = typeof msg.id === "string" ? msg.id : "";
+          const source = roomInfo.videoSources.find((v) => v.id === id);
+          if (!source || source.addedById !== stableUserId(info)) return;
+          // Twitch/Kick embeds always show their own chrome, so "only the
+          // adder steers" is unenforceable there and was forced open when the
+          // source was added — reopening that decision here would only produce
+          // a setting the embed ignores.
+          if (source.kind === "twitch" || source.kind === "kick") return;
+          const next = allowedControlMode(info, msg.controlMode);
+          if (next === source.controlMode) return;
+          source.controlMode = next;
+          publishRoomVideoSources(info.room, roomInfo);
+          broadcastToRoom(info.room, {
+            type: "video-source-control-mode",
+            id: source.id,
+            controlMode: source.controlMode,
+          });
           break;
         }
         // Play/pause/seek, from whoever touched their player. Dropped
@@ -4860,6 +5009,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             ...(parsed?.playlistId ? { playlistId: parsed.playlistId } : {}),
             addedById: stableUserId(info),
             addedByName: info.name,
+            controlMode: msg.controlMode === "anyone" ? "anyone" : "owner",
             // Starts playing, same reasoning as a video source: putting
             // music on and then having to press play is a step nobody meant
             // to ask for.
@@ -4884,6 +5034,23 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           broadcastToRoom(info.room, { type: "music", music: null });
           break;
         }
+        // Changing who may drive the music already playing, without taking it
+        // off and putting it back — which would cost the room its place in the
+        // track. Only the room's management decides that, whatever the mode
+        // currently is: "anyone" opened the transport, not this switch.
+        case "music-control-mode": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsVideoSourceLimiter, info.rateLimitKey, "video-source"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo?.music) return;
+          if (!isRoomManager(roomInfo, info)) return;
+          const next = msg.controlMode === "anyone" ? "anyone" : "owner";
+          if (next === roomInfo.music.controlMode) return;
+          roomInfo.music.controlMode = next;
+          publishRoomMusic(info.room, roomInfo);
+          broadcastToRoom(info.room, { type: "music", music: roomInfo.music });
+          break;
+        }
         // Play/pause/seek/skip. Ignored silently for anyone who isn't a
         // manager: a client honoring the same rule is already blocked from
         // reaching this, so anything that does arrive is not an honest
@@ -4895,7 +5062,10 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           if (!roomInfo) return;
           const music = roomInfo.music;
           if (!music) return;
-          if (!isRoomManager(roomInfo, info)) return;
+          // The room's management, unless whoever put it on opened it up.
+          // Deliberately no account check here, unlike setting the music:
+          // this is playback, and a room's owner may well be a guest.
+          if (music.controlMode !== "anyone" && !isRoomManager(roomInfo, info)) return;
           // Addressed at the source this client believes it is steering — a
           // transport message that raced a replacement must not be applied
           // to the song that took its place.
