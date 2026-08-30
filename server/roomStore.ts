@@ -218,6 +218,23 @@ export function normalizeRoomDescription(raw: unknown): string {
   return raw.replace(/\s+/g, " ").trim().slice(0, MAX_ROOM_DESCRIPTION_LENGTH);
 }
 
+// Floors at two, because a limit of one is a room that can never be more than
+// its owner — "sala fechada" is a different feature, and this would be a
+// confusing way to spell it. Caps well above what a mesh room is comfortable
+// at: this is the host's own call about their room, and the app already
+// degrades quality rather than refusing people (see useMeshCapacity).
+export const MIN_ROOM_MEMBER_LIMIT = 2;
+export const MAX_ROOM_MEMBER_LIMIT = 200;
+
+// Anything that isn't a whole number in range reads as "no limit" rather than
+// being stored and then quietly turning people away at a number nobody chose.
+export function normalizeMemberLimit(raw: unknown): number | null {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return null;
+  const rounded = Math.floor(raw);
+  if (rounded < MIN_ROOM_MEMBER_LIMIT) return null;
+  return Math.min(rounded, MAX_ROOM_MEMBER_LIMIT);
+}
+
 export interface RoomRecord {
   ownerId: string;
   // Derived from the `priv-` handle prefix at creation time (see
@@ -242,6 +259,11 @@ export interface RoomRecord {
   // what gives a room persisted before they existed sane starting values
   // without a backfill migration.
   admins: RoomAdmin[];
+  // How many ordinary members the room accepts at once, or null for no limit
+  // (which is every room until somebody sets one). See signaling.ts's join
+  // gate: the room's owner and admins are never turned away by it, so setting
+  // one can't lock the people who run the room out of it.
+  memberLimit: number | null;
   // See RoomBan. Persisted with the room, like `admins`, so a ban outlives the
   // room emptying out — a ban that expired the moment the last person left
   // would be no ban at all.
@@ -267,6 +289,7 @@ function normalizeRoomRecord(raw: unknown): RoomRecord | null {
     flags: Array.isArray(record.flags) ? record.flags.filter((f) => typeof f === "string") : [],
     code: typeof record.code === "string" ? record.code : null,
     admins: normalizeRoomAdmins(record.admins),
+    memberLimit: normalizeMemberLimit(record.memberLimit),
     bans: normalizeRoomBans(record.bans),
     permissions: normalizeRoomPermissions(record.permissions),
     location: normalizeRoomLocation(record.location),

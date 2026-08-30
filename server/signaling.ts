@@ -55,6 +55,7 @@ import {
   type RoomRecord,
   type RoomAdmin,
   type RoomBan,
+  normalizeMemberLimit,
   type RoomPermissions,
 } from "./roomStore.js";
 import {
@@ -687,7 +688,15 @@ function roomSettingsPayload(roomInfo: RoomInfo) {
   return {
     ownerId: roomInfo.ownerId,
     admins: roomInfo.admins,
-    bans: roomInfo.bans,
+    // Deliberately NOT the ban list. This payload is broadcast to the whole
+    // room, and a ban carries both the names of people the room threw out and
+    // the address it also matches on (see RoomBan). Managers get it through
+    // sendRoomBansToManagers, which is addressed rather than broadcast.
+    //
+    // The member limit, on the other hand, is everybody's business: a room
+    // being full is something anyone in it can see by counting, and someone
+    // who cannot get in is better told why than left guessing.
+    memberLimit: roomInfo.memberLimit,
     permissions: roomInfo.permissions,
     location: roomInfo.location,
     description: roomInfo.description,
@@ -707,6 +716,7 @@ function persistRoomRecord(room: string, roomInfo: RoomInfo): void {
     code: roomInfo.code,
     admins: roomInfo.admins,
     bans: roomInfo.bans,
+    memberLimit: roomInfo.memberLimit,
     permissions: roomInfo.permissions,
     location: roomInfo.location,
     description: roomInfo.description,
@@ -1435,6 +1445,7 @@ function roomRecordOf(roomInfo: RoomInfo): RoomRecord {
     code: roomInfo.code,
     admins: roomInfo.admins,
     bans: roomInfo.bans,
+    memberLimit: roomInfo.memberLimit,
     permissions: roomInfo.permissions,
     location: roomInfo.location,
     description: roomInfo.description,
@@ -4343,6 +4354,24 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             return;
           }
 
+          // Full. The room's own owner and admins are never turned away by
+          // their own limit — locking the people who run a room out of it is
+          // never what setting one meant — and a moderator's admin-join is not
+          // a participant at all (see realPeopleCount).
+          const joiningRoom = rooms.get(room);
+          if (
+            joiningRoom?.memberLimit &&
+            !isRoomManager(joiningRoom, info) &&
+            realPeopleCount(joiningRoom) >= joiningRoom.memberLimit
+          ) {
+            send(socket, {
+              type: "join-error",
+              message: `Esta sala está cheia (limite de ${joiningRoom.memberLimit} pessoas).`,
+              full: true,
+            });
+            return;
+          }
+
           if (info.room) leaveRoom(info);
           clearRoomDeletionTimer(room);
           info.room = room;
@@ -4399,6 +4428,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
                 // DEFAULT_ROOM_PERMISSIONS.
                 admins: [],
                 bans: [],
+                memberLimit: null,
                 permissions: { ...DEFAULT_ROOM_PERMISSIONS },
                 // Unplaced and undescribed until someone says otherwise —
                 // see "room-location-set" and "room-info-set".
@@ -4828,6 +4858,27 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           persistRoomRecord(info.room, roomInfo);
           publishRoomRecord(info.room, roomInfo);
           broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+          break;
+        }
+        // How many people the room takes at once. Owner and admins both — it
+        // is a room setting like the permission switches beside it, not
+        // something that can be turned against the owner.
+        case "room-member-limit": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsVideoSourceLimiter, info.rateLimitKey, "video-source"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (!isRoomManager(roomInfo, info)) return;
+          const next = normalizeMemberLimit(msg.limit);
+          if (next === roomInfo.memberLimit) return;
+          roomInfo.memberLimit = next;
+          persistRoomRecord(info.room, roomInfo);
+          publishRoomRecord(info.room, roomInfo);
+          broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+          // Nobody is thrown out to meet a limit set below the number already
+          // here, deliberately. Lowering it says "no more from now on"; a
+          // switch that ejects people who were already talking is a different
+          // and much ruder thing, and the room has kick for when that is meant.
           break;
         }
         // Throwing somebody out of the room, for now or for good. Both are
