@@ -4342,33 +4342,46 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             }
             roomInfo = rooms.get(room);
             if (!roomInfo) {
-              // No prior record means this join is the one creating the
-              // room from scratch — this connection becomes its first
-              // owner, and private/flags/code get real starting values
-              // (see roomStore.ts's RoomRecord — none of it is enforced
-              // anywhere yet, just persisted).
+              // Determine ownership: if restoring an existing record whose owner was a guest
+              // (or if the recorded owner is absent/unassigned), the first person to join
+              // becomes the room owner.
+              let ownerId = targetUserId;
+              if (existingRecord?.ownerId) {
+                if (existingRecord.ownerId === targetUserId) {
+                  ownerId = targetUserId;
+                } else if (!existingRecord.ownerId.startsWith("guest:") && existingRecord.admins?.some((a) => a.id === targetUserId)) {
+                  ownerId = existingRecord.ownerId;
+                } else if (existingRecord.ownerId.startsWith("guest:")) {
+                  ownerId = targetUserId;
+                } else {
+                  ownerId = existingRecord.ownerId;
+                }
+              }
+
               const isPrivate = isPrivateRoom(room);
-              const record: RoomRecord = existingRecord ?? {
-                ownerId: targetUserId,
-                private: isPrivate,
-                flags: [],
-                // From the handle itself when it carries one (see
-                // roomCodeFromHandle) — the client generated it, and the
-                // URL is what everyone shares.
-                code: isPrivate ? roomCodeFromHandle(room) ?? generateRoomCode() : null,
-                // A brand new room has nobody but its owner running it, and
-                // every action wide open — see roomStore.ts's
-                // DEFAULT_ROOM_PERMISSIONS.
-                admins: [],
-                permissions: { ...DEFAULT_ROOM_PERMISSIONS },
-                // Unplaced and undescribed until someone says otherwise —
-                // see "room-location-set" and "room-info-set".
-                location: null,
-                description: "",
-                category: null,
-                bannedMembers: [],
-                mutedMembers: [],
-              };
+              const record: RoomRecord = existingRecord
+                ? { ...existingRecord, ownerId }
+                : {
+                    ownerId,
+                    private: isPrivate,
+                    flags: [],
+                    // From the handle itself when it carries one (see
+                    // roomCodeFromHandle) — the client generated it, and the
+                    // URL is what everyone shares.
+                    code: isPrivate ? roomCodeFromHandle(room) ?? generateRoomCode() : null,
+                    // A brand new room has nobody but its owner running it, and
+                    // every action wide open — see roomStore.ts's
+                    // DEFAULT_ROOM_PERMISSIONS.
+                    admins: [],
+                    permissions: { ...DEFAULT_ROOM_PERMISSIONS },
+                    // Unplaced and undescribed until someone says otherwise —
+                    // see "room-location-set" and "room-info-set".
+                    location: null,
+                    description: "",
+                    category: null,
+                    bannedMembers: [],
+                    mutedMembers: [],
+                  };
               roomInfo = {
                 sockets: new Set(),
                 createdAt: Date.now(),
@@ -4385,12 +4398,21 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
               roomWasCreated = !existingRecord;
               publishRoomCreated(room, roomInfo);
               roomsCreatedTotal.inc({ visibility: isPrivateRoom(room) ? "private" : "public" });
-              if (!existingRecord) void saveRoomRecord(room, record);
+              if (!existingRecord || existingRecord.ownerId !== ownerId) void saveRoomRecord(room, record);
             }
           }
           if (roomInfo.bannedMembers.some((b) => b.id === targetUserId)) {
             send(socket, { type: "join-error", message: "Você foi banido desta sala pela administração." });
             return;
+          }
+          // If the in-memory room had 0 sockets and its previous owner was a guest or is absent,
+          // hand over ownership to the active joiner immediately.
+          if (roomInfo.sockets.size === 0 && roomInfo.ownerId !== targetUserId) {
+            if (roomInfo.ownerId?.startsWith("guest:") || !isPresentInRoom(roomInfo, roomInfo.ownerId)) {
+              roomInfo.ownerId = targetUserId;
+              persistRoomRecord(room, roomInfo);
+              publishRoomRecord(room, roomInfo);
+            }
           }
           // The await above gave this socket's own "leave"/another "join"
           // a chance to run first and move it elsewhere (or the socket
