@@ -100,11 +100,22 @@ let accountsByOAuth = new Map<string, string>();
 // asserted *verified* — an unverified one must not be enough to find, and
 // then claim, someone else's account (see findAccountByVerifiedEmail).
 let accountsByVerifiedEmail = new Map<string, string>();
-// A registered account's "nick" (see the register handler in signaling.ts)
-// is whichever of username/displayName someone types — both need to
-// resolve to the same owner, so this reservation map is keyed by either,
-// distinct from accountsByUsername above (which is strictly for login).
-let reservedNames = new Map<string, string>(); // folded name -> id
+// A registered account's name reservation, folded name -> id. Usernames only.
+//
+// Display names used to be reserved here too, which made them globally
+// unique — every account's display name was a name nobody else could take,
+// as a display name *or* as a username, and a guest could not use it in a
+// room either. That is a lot of the namespace spent on the one field where
+// duplicates cost nothing: two people called "João" are not a problem the way
+// two accounts at /user/joao would be. It also made signing up a hunt — every
+// rejection came back as one word, "já em uso", without saying which of the
+// two fields was the problem — and hunting is what walked people into the
+// rate limiter and out through the auto-ban.
+//
+// So: usernames are unique and reserved, display names are free. Identity
+// lives on the username (see accountsByUsername, and the unique index in
+// accountModels.ts); the display name is a label.
+let reservedNames = new Map<string, string>(); // folded username -> id
 
 function fold(name: string): string {
   return name.toLowerCase();
@@ -311,7 +322,6 @@ function unindexAccount(account: FullAccount) {
   accountsById.delete(account.id);
   accountsByUsername.delete(fold(account.username));
   reservedNames.delete(fold(account.username));
-  reservedNames.delete(fold(account.displayName));
   for (const identity of account.oauth) {
     accountsByOAuth.delete(oauthIndexKey(identity.provider, identity.providerUserId));
   }
@@ -339,7 +349,6 @@ function indexAccount(account: FullAccount) {
   accountsById.set(account.id, account);
   accountsByUsername.set(fold(account.username), account.id);
   reservedNames.set(fold(account.username), account.id);
-  reservedNames.set(fold(account.displayName), account.id);
   for (const identity of account.oauth) {
     accountsByOAuth.set(oauthIndexKey(identity.provider, identity.providerUserId), account.id);
   }
@@ -393,10 +402,22 @@ export async function initAccountStore(): Promise<void> {
   }
 }
 
-// Returns the id of the account that owns `foldedName` (as a username or a
-// display name), or undefined if it isn't reserved by anyone.
+// Returns the id of the account whose *username* is `foldedName`, or undefined
+// if nobody holds it. Display names are not reserved — see reservedNames.
 export function isNameReserved(foldedName: string): string | undefined {
   return reservedNames.get(foldedName);
+}
+
+// Whether a username is already somebody's. The live answer behind
+// GET /auth/username-available (see signaling.ts), which exists so that
+// finding a free username is a thing you do while typing rather than by
+// submitting the form over and over — the latter is what burned the signup
+// rate limit and got people auto-banned for trying to sign up.
+//
+// In-memory and therefore cheap: this is the same index every login goes
+// through, so answering it costs a map lookup, not a database round trip.
+export function isUsernameTaken(username: string): boolean {
+  return reservedNames.has(fold(username));
 }
 
 export function getPublicAccountById(id: string): PublicAccount | null {
@@ -498,7 +519,6 @@ export async function refreshAccountFromMongo(id: string): Promise<PublicAccount
       accountsById.delete(id);
       accountsByUsername.delete(fold(existing.username));
       reservedNames.delete(fold(existing.username));
-      reservedNames.delete(fold(existing.displayName));
       for (const identity of existing.oauth) {
         accountsByOAuth.delete(oauthIndexKey(identity.provider, identity.providerUserId));
       }
@@ -524,8 +544,11 @@ function assertNamesAvailable(username: string, displayName: string) {
   if (!isValidAccountDisplayName(displayName)) {
     throw new Error("Nome de exibição inválido.");
   }
-  if (reservedNames.has(fold(username)) || reservedNames.has(fold(displayName))) {
-    throw new Error("Usuário ou nome de exibição já em uso.");
+  // Only the username. A display name is a label, not an identity — see
+  // reservedNames — so two accounts may share one, and the error below says
+  // exactly which field is the problem rather than making somebody guess.
+  if (reservedNames.has(fold(username))) {
+    throw new Error("Esse usuário já está em uso.");
   }
 }
 

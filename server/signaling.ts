@@ -31,6 +31,7 @@ import {
   refreshAccountFromMongo,
   getAccountConnections,
   isNameReserved,
+  isUsernameTaken,
   getPublicAccountById,
   addAccountPoints,
   addAccountCallStats,
@@ -56,6 +57,8 @@ import {
   DEFAULT_ROOM_PERMISSIONS,
   type RoomRecord,
   type RoomAdmin,
+  type RoomBan,
+  normalizeMemberLimit,
   type RoomPermissions,
   type RoomBannedMember,
 } from "./roomStore.js";
@@ -378,6 +381,12 @@ interface ClientInfo {
   // the announcer's.
   sharingFiles?: SharedFileState[];
   mic: boolean;
+  // Whether this person has silenced *everyone else's* mic for themselves
+  // ("silenciar microfones"). Purely their own listening setting — it changes
+  // nothing about what anybody transmits — but it is worth the room knowing,
+  // for the same reason a muted mic is: talking to somebody who cannot hear
+  // you is the one thing a participant list can save you from.
+  micsMuted?: boolean;
   isAlive: boolean;
   socket: WebSocket;
   // The connecting IP (see request.ip in the "/ws" handler below). Never
@@ -694,6 +703,15 @@ function roomSettingsPayload(roomInfo: RoomInfo) {
   return {
     ownerId: roomInfo.ownerId,
     admins: roomInfo.admins,
+    // Deliberately NOT the ban list. This payload is broadcast to the whole
+    // room, and a ban carries both the names of people the room threw out and
+    // the address it also matches on (see RoomBan). Managers get it through
+    // sendRoomBansToManagers, which is addressed rather than broadcast.
+    //
+    // The member limit, on the other hand, is everybody's business: a room
+    // being full is something anyone in it can see by counting, and someone
+    // who cannot get in is better told why than left guessing.
+    memberLimit: roomInfo.memberLimit,
     permissions: roomInfo.permissions,
     location: roomInfo.location,
     description: roomInfo.description,
@@ -714,6 +732,8 @@ function persistRoomRecord(room: string, roomInfo: RoomInfo): void {
     flags: roomInfo.flags,
     code: roomInfo.code,
     admins: roomInfo.admins,
+    bans: roomInfo.bans,
+    memberLimit: roomInfo.memberLimit,
     permissions: roomInfo.permissions,
     location: roomInfo.location,
     description: roomInfo.description,
@@ -1443,6 +1463,8 @@ function roomRecordOf(roomInfo: RoomInfo): RoomRecord {
     flags: roomInfo.flags,
     code: roomInfo.code,
     admins: roomInfo.admins,
+    bans: roomInfo.bans,
+    memberLimit: roomInfo.memberLimit,
     permissions: roomInfo.permissions,
     location: roomInfo.location,
     description: roomInfo.description,
@@ -1849,11 +1871,24 @@ interface ClusterStateDump {
   }[];
   pendingSignals: [string, PendingSignal[]][];
   turnstile: [string, number][];
-  announcement: Announcement | null;
+  // Deliberately absent: the active announcement, the partner config and the
+  // supporters list. All three come from persistent storage, every worker
+  // loads them itself at startup (see registerSignalingRoutes), and every
+  // later change is published on the bus by its own event
+  // ("announcement:set", "partner:config", "supporters:set").
+  //
+  // Carrying them here was not merely redundant, it was destructive. A worker
+  // answers "state:request" with whatever it holds *at that instant*, and on a
+  // full restart that instant is often before its own async load has resolved
+  // — so it answers with an empty list, and the worker that asked overwrites
+  // its own correctly-loaded list with nothing. That is the whole of "os
+  // apoiadores resetam a cada restart".
+  //
+  // The counters below stay: announcementStats and partnerStats live only in
+  // memory, so a sibling really is the only place a starting worker can learn
+  // them from.
   announcementStats: { viewerIds: string[]; buttonClicks: number; xClicks: number } | null;
-  partnerConfig: PartnerConfig;
   partnerStats: [string, { viewerIds: string[]; counts: Omit<PartnerStatsEntry, "viewerIds"> }][];
-  supporters: Supporter[];
 }
 
 function buildClusterStateDump(): ClusterStateDump {
@@ -1875,7 +1910,6 @@ function buildClusterStateDump(): ClusterStateDump {
     })),
     pendingSignals: [...pendingSignals.entries()],
     turnstile: [...turnstileVerifiedIps.entries()],
-    announcement: currentAnnouncement,
     announcementStats: announcementStats
       ? {
           viewerIds: [...announcementStats.viewerIds],
@@ -1883,7 +1917,6 @@ function buildClusterStateDump(): ClusterStateDump {
           xClicks: announcementStats.xClicks,
         }
       : null,
-    partnerConfig,
     partnerStats: [...partnerStats.entries()].map(([id, entry]) => [
       id,
       {
@@ -1898,7 +1931,6 @@ function buildClusterStateDump(): ClusterStateDump {
         },
       },
     ]),
-    supporters: currentSupporters,
   };
 }
 
@@ -1906,6 +1938,12 @@ function buildClusterStateDump(): ClusterStateDump {
 // only added, never removed. A live event that landed while the dump was in
 // flight describes a *newer* truth than the dump does, and must not be
 // undone by it.
+//
+// The rule holds for everything in here now, including the counters at the
+// bottom. It used to be broken by three wholesale assignments (the
+// announcement, the partner config, the supporters list), which is how a
+// restart could wipe a list that had just been read off Redis — see
+// ClusterStateDump, where those three no longer travel at all.
 function applyClusterStateDump(dump: ClusterStateDump): void {
   for (const snap of dump.clients) applyClientSnapshot(snap);
   for (const entry of dump.rooms) {
@@ -1937,21 +1975,21 @@ function applyClusterStateDump(dump: ClusterStateDump): void {
   for (const [ip, at] of dump.turnstile) {
     if (!turnstileVerifiedIps.has(ip)) turnstileVerifiedIps.set(ip, at);
   }
-  currentAnnouncement = dump.announcement;
-  announcementStats = dump.announcementStats
-    ? {
-        viewerIds: new Set(dump.announcementStats.viewerIds),
-        buttonClicks: dump.announcementStats.buttonClicks,
-        xClicks: dump.announcementStats.xClicks,
-      }
-    : null;
-  partnerConfig = dump.partnerConfig;
+  // Only taken when this worker has none of its own: these are running
+  // totals, and a straggler's dump answering the same request must not reset
+  // a counter that has been ticking since.
+  if (!announcementStats && dump.announcementStats) {
+    announcementStats = {
+      viewerIds: new Set(dump.announcementStats.viewerIds),
+      buttonClicks: dump.announcementStats.buttonClicks,
+      xClicks: dump.announcementStats.xClicks,
+    };
+  }
   for (const [id, entry] of dump.partnerStats) {
     const target = getPartnerStats(id);
     for (const viewerId of entry.viewerIds) target.viewerIds.add(viewerId);
     Object.assign(target, entry.counts);
   }
-  currentSupporters = dump.supporters;
 }
 
 // How long a starting worker waits for an answer before giving up and
@@ -2444,6 +2482,7 @@ function peerSummary(info: ClientInfo) {
     // See ClientInfo.sharingFiles. Empty for anyone not playing one.
     files: info.sharingFiles ?? [],
     mic: info.mic,
+    micsMuted: info.micsMuted ?? false,
     // Not logged into a registered account — the client renders this as a
     // "(guest)" suffix wherever the name is shown (see lib/displayName.ts).
     isGuest: !info.accountId,
@@ -2711,6 +2750,42 @@ function flushClientStats(info: ClientInfo) {
   }
 }
 
+// What a ban looks like to the room's managers: everything except the address
+// it also matches on. A room's host can ban somebody without being handed
+// their members' IPs, and the ban works exactly as well either way — see
+// RoomBan in roomStore.ts.
+function publicRoomBan(ban: RoomBan) {
+  return { id: ban.id, name: ban.name, bannedAt: ban.bannedAt };
+}
+
+// Pushes the ban list to everyone in the room who is allowed to see it, and
+// to nobody else. Separate from roomSettingsPayload for exactly that reason.
+function sendRoomBansToManagers(room: string, roomInfo: RoomInfo): void {
+  for (const sock of roomInfo.sockets) {
+    const client = clients.get(sock);
+    if (client && isRoomManager(roomInfo, client)) {
+      send(sock, { type: "room-bans", bans: roomInfo.bans.map(publicRoomBan) });
+    }
+  }
+}
+
+// Whether this connection is one of the people a room threw out. Any handle
+// matching is enough — see RoomBan for what each is worth. The guest-name
+// check is deliberately guest-only: an account's display name is not what its
+// ban is keyed on, and catching an account by a name somebody else was banned
+// under would be a false positive with a real person behind it.
+function matchesRoomBan(bans: RoomBan[], info: ClientInfo): boolean {
+  const userId = stableUserId(info);
+  const guestName = info.accountId ? null : info.name?.trim().toLowerCase();
+  return bans.some(
+    (ban) =>
+      ban.id === userId ||
+      (Boolean(ban.accountId) && ban.accountId === info.accountId) ||
+      (Boolean(ban.ip) && ban.ip === info.ip) ||
+      (Boolean(guestName) && Boolean(ban.guestName) && ban.guestName === guestName)
+  );
+}
+
 function leaveRoom(info: ClientInfo) {
   flushClientStats(info);
   if (!info.room) return;
@@ -2770,6 +2845,7 @@ function leaveRoom(info: ClientInfo) {
   info.sharingCamera = undefined;
   info.sharingFiles = [];
   info.mic = false;
+  info.micsMuted = false;
   broadcastToRoom(room, { type: "peer-left", id: info.id }, info.socket);
 }
 
@@ -3108,6 +3184,40 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
   // adminAuth.ts) — it's just an account whose flags include "ADMIN" (see
   // accountStore.ts's initAccountStore bootstrap), checked identically to
   // every other route below via requireAdmin.
+  // Is this username free? Asked as somebody types, which is the whole point:
+  // before this existed, the only way to find out was to submit the signup
+  // form and read the error — so finding a free username meant five, ten,
+  // fifteen POSTs to /auth/register, which is exactly the shape the rate
+  // limiter and the auto-ban are built to stop. People were being banned for
+  // trying to sign up.
+  //
+  // Cheap enough to be asked freely: it is one lookup in the same in-memory
+  // index every login goes through (see isUsernameTaken), no database round
+  // trip and no password hashing — which is why the budget here is generous
+  // where /auth/register's is deliberately tight.
+  //
+  // It does let someone enumerate which usernames exist. That is already true
+  // of every site with public profiles, and this one has them at /user/:id —
+  // a username is a public handle, not a secret, and the alternative on offer
+  // was banning real people for typing.
+  app.get(
+    "/auth/username-available",
+    { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+    async (request) => {
+      const raw = (request.query as { username?: unknown } | undefined)?.username;
+      const username = (typeof raw === "string" ? raw.trim() : "").toLowerCase();
+      if (!USERNAME_RE.test(username)) {
+        return {
+          username,
+          valid: false,
+          available: false,
+          error: "Use 3 a 20 letras, números ou _.",
+        };
+      }
+      return { username, valid: true, available: !isUsernameTaken(username) };
+    }
+  );
+
   // Account creation — cheap to abuse into a spam/enumeration tool if left
   // uncapped (each attempt tries a password hash + a uniqueness check), and
   // nobody legitimately creates more than a couple of accounts per IP in a
@@ -4329,6 +4439,40 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
             }
           }
 
+          // Thrown out of this room for good (see "room-ban"). Checked against
+          // the *persisted* record as well as the live one, because a room that
+          // emptied out and came back is the same room to everybody except its
+          // memory — and a ban that lapsed while nobody was in it would be a
+          // ban you wait out by waiting.
+          const existingBans =
+            rooms.get(room)?.bans ?? (await loadRoomRecord(room))?.bans ?? [];
+          if (matchesRoomBan(existingBans, info)) {
+            send(socket, {
+              type: "join-error",
+              message: "Você foi banido desta sala.",
+              banned: true,
+            });
+            return;
+          }
+
+          // Full. The room's own owner and admins are never turned away by
+          // their own limit — locking the people who run a room out of it is
+          // never what setting one meant — and a moderator's admin-join is not
+          // a participant at all (see realPeopleCount).
+          const joiningRoom = rooms.get(room);
+          if (
+            joiningRoom?.memberLimit &&
+            !isRoomManager(joiningRoom, info) &&
+            realPeopleCount(joiningRoom) >= joiningRoom.memberLimit
+          ) {
+            send(socket, {
+              type: "join-error",
+              message: `Esta sala está cheia (limite de ${joiningRoom.memberLimit} pessoas).`,
+              full: true,
+            });
+            return;
+          }
+
           if (info.room) leaveRoom(info);
           clearRoomDeletionTimer(room);
           info.room = room;
@@ -4337,6 +4481,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           info.sharingCamera = undefined;
           info.sharingFiles = [];
           info.mic = false;
+          info.micsMuted = false;
           // Starts this connection's call-time segment (see
           // flushClientStats) — never for a moderator's admin-join ghost
           // connection, which never reaches this branch anyway.
@@ -4401,6 +4546,8 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
                     // every action wide open — see roomStore.ts's
                     // DEFAULT_ROOM_PERMISSIONS.
                     admins: [],
+                    bans: [],
+                    memberLimit: null,
                     permissions: { ...DEFAULT_ROOM_PERMISSIONS },
                     // Unplaced and undescribed until someone says otherwise —
                     // see "room-location-set" and "room-info-set".
@@ -4429,8 +4576,12 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
               if (!existingRecord || existingRecord.ownerId !== ownerId) void saveRoomRecord(room, record);
             }
           }
-          if (roomInfo.bannedMembers.some((b) => b.id === targetUserId)) {
-            send(socket, { type: "join-error", message: "Você foi banido desta sala pela administração." });
+          if (matchesRoomBan(roomInfo.bans, info)) {
+            send(socket, {
+              type: "join-error",
+              message: "Você foi banido desta sala.",
+              banned: true,
+            });
             return;
           }
           if (roomInfo.kickedMembers?.has(targetUserId)) {
@@ -4559,6 +4710,7 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           info.sharingCamera = undefined;
           info.sharingFiles = [];
           info.mic = false;
+          info.micsMuted = false;
           roomInfo.sockets.add(socket);
           publishRoomMember(room, info, true);
           const adminPeers = [...roomInfo.sockets]
@@ -4691,6 +4843,21 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           });
           break;
         }
+        // "Silenciar microfones" — see ClientInfo.micsMuted. Same shape and
+        // the same budget as the mic toggle beside it, and dropped just as
+        // silently when over it: this is transient state, and the next real
+        // toggle re-announces it anyway.
+        case "mics-muted": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
+          info.micsMuted = Boolean(msg.muted);
+          broadcastToRoom(info.room, {
+            type: "peer-mics-muted",
+            id: info.id,
+            micsMuted: info.micsMuted,
+          });
+          break;
+        }
         case "mic": {
           if (!info.room) return;
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
@@ -4812,133 +4979,6 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
           break;
         }
-        case "room-kick": {
-          if (!info.room) return;
-          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
-          const roomInfo = rooms.get(info.room);
-          if (!roomInfo) return;
-          if (!isRoomManager(roomInfo, info)) return;
-          const targetUserId = typeof msg.userId === "string" ? msg.userId : "";
-          if (!targetUserId || targetUserId === roomInfo.ownerId) return;
-          if (!isRoomOwner(roomInfo, info) && roomInfo.admins.some((a) => a.id === targetUserId)) return;
-          const callerId = stableUserId(info);
-          if (targetUserId === callerId) return;
-
-          if (!roomInfo.kickedMembers) {
-            roomInfo.kickedMembers = new Map();
-          }
-          const kickUntil = Date.now() + ROOM_KICK_COOLDOWN_MS;
-          roomInfo.kickedMembers.set(targetUserId, kickUntil);
-          clusterEvent("room:kick", { room: info.room, userId: targetUserId, until: kickUntil });
-
-          const targets = [...roomInfo.sockets]
-            .map((s) => ({ socket: s, client: clients.get(s) }))
-            .filter(
-              (item): item is { socket: WebSocket; client: ClientInfo } =>
-                item.client !== undefined &&
-                !item.client.isModerator &&
-                stableUserId(item.client) === targetUserId
-            );
-
-          if (targets.length === 0) return;
-
-          for (const target of targets) {
-            send(target.socket, {
-              type: "room-kicked",
-              message: "Você foi expulso da sala pela administração.",
-              cooldownSeconds: 10,
-            });
-            leaveRoom(target.client);
-          }
-          break;
-        }
-        case "room-ban": {
-          if (!info.room) return;
-          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
-          const roomInfo = rooms.get(info.room);
-          if (!roomInfo) return;
-          if (!isRoomManager(roomInfo, info)) return;
-          const targetUserId = typeof msg.userId === "string" ? msg.userId : "";
-          if (!targetUserId || targetUserId === roomInfo.ownerId) return;
-          if (!isRoomOwner(roomInfo, info) && roomInfo.admins.some((a) => a.id === targetUserId)) return;
-          const callerId = stableUserId(info);
-          if (targetUserId === callerId) return;
-
-          const targetInRoom = [...roomInfo.sockets]
-            .map((s) => clients.get(s))
-            .find(
-              (c): c is ClientInfo =>
-                c !== undefined && !c.isModerator && stableUserId(c) === targetUserId
-            );
-
-          const targetName =
-            (targetInRoom && targetInRoom.name) ||
-            (typeof msg.name === "string" && msg.name.trim() ? msg.name.trim() : "Participante");
-
-          const banReason =
-            typeof msg.reason === "string" ? msg.reason.trim().slice(0, 100) : undefined;
-
-          const newBanEntry: RoomBannedMember = {
-            id: targetUserId,
-            name: targetName,
-            bannedAt: Date.now(),
-            bannedBy: callerId,
-            reason: banReason,
-          };
-
-          roomInfo.bannedMembers = [
-            ...roomInfo.bannedMembers.filter((b) => b.id !== targetUserId),
-            newBanEntry,
-          ];
-
-          if (roomInfo.admins.some((a) => a.id === targetUserId)) {
-            roomInfo.admins = roomInfo.admins.filter((a) => a.id !== targetUserId);
-          }
-          if (roomInfo.mutedMembers.includes(targetUserId)) {
-            roomInfo.mutedMembers = roomInfo.mutedMembers.filter((id) => id !== targetUserId);
-          }
-
-          persistRoomRecord(info.room, roomInfo);
-          publishRoomRecord(info.room, roomInfo);
-          broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
-
-          const targets = [...roomInfo.sockets]
-            .map((s) => ({ socket: s, client: clients.get(s) }))
-            .filter(
-              (item): item is { socket: WebSocket; client: ClientInfo } =>
-                item.client !== undefined &&
-                !item.client.isModerator &&
-                stableUserId(item.client) === targetUserId
-            );
-
-          for (const target of targets) {
-            send(target.socket, {
-              type: "room-banned",
-              message: "Você foi banido desta sala pela administração.",
-            });
-            leaveRoom(target.client);
-          }
-          break;
-        }
-        case "room-unban": {
-          if (!info.room) return;
-          if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
-          const roomInfo = rooms.get(info.room);
-          if (!roomInfo) return;
-          if (!isRoomManager(roomInfo, info)) return;
-          const targetUserId = typeof msg.userId === "string" ? msg.userId.trim() : "";
-          if (!targetUserId) return;
-          if (!roomInfo.bannedMembers.some((b) => b.id === targetUserId)) return;
-
-          roomInfo.bannedMembers = roomInfo.bannedMembers.filter((b) => b.id !== targetUserId);
-          if (roomInfo.kickedMembers) {
-            roomInfo.kickedMembers.delete(targetUserId);
-          }
-          persistRoomRecord(info.room, roomInfo);
-          publishRoomRecord(info.room, roomInfo);
-          broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
-          break;
-        }
         case "room-member-mute": {
           if (!info.room) return;
           if (!(await consumeRateLimit(wsToggleLimiter, info.rateLimitKey, "toggle"))) return;
@@ -5049,6 +5089,146 @@ export async function registerSignalingRoutes(app: FastifyInstance, genId: () =>
           persistRoomRecord(info.room, roomInfo);
           publishRoomRecord(info.room, roomInfo);
           broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+          break;
+        }
+        // How many people the room takes at once. Owner and admins both — it
+        // is a room setting like the permission switches beside it, not
+        // something that can be turned against the owner.
+        case "room-member-limit": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsVideoSourceLimiter, info.rateLimitKey, "video-source"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (!isRoomManager(roomInfo, info)) return;
+          const next = normalizeMemberLimit(msg.limit);
+          if (next === roomInfo.memberLimit) return;
+          roomInfo.memberLimit = next;
+          persistRoomRecord(info.room, roomInfo);
+          publishRoomRecord(info.room, roomInfo);
+          broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+          // Nobody is thrown out to meet a limit set below the number already
+          // here, deliberately. Lowering it says "no more from now on"; a
+          // switch that ejects people who were already talking is a different
+          // and much ruder thing, and the room has kick for when that is meant.
+          break;
+        }
+        // Throwing somebody out of the room, for now or for good. Both are
+        // the room's own moderation — nothing to do with the site-wide bans in
+        // moderationStore.ts, which are a moderator's tool and reach across
+        // every room at once.
+        //
+        // Owner and admins both, because moderating is what admins are for.
+        // With two limits that keep the power from turning on the room itself:
+        // nobody may throw out the owner, and only the owner may throw out an
+        // admin. Without the second, one admin could clear the bench of the
+        // others and leave the owner alone among strangers.
+        case "room-kick":
+        case "room-ban": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsVideoSourceLimiter, info.rateLimitKey, "video-source"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (!isRoomManager(roomInfo, info)) return;
+          const targetId = typeof msg.userId === "string" ? msg.userId.trim() : "";
+          if (!targetId || targetId === stableUserId(info)) return;
+          if (targetId === roomInfo.ownerId) return;
+          const targetIsAdmin = roomInfo.admins.some((a) => a.id === targetId);
+          if (targetIsAdmin && !isRoomOwner(roomInfo, info)) return;
+
+          // Every connection that identity has in this room — a second tab is
+          // the obvious way to walk straight back in otherwise.
+          const targets = [...roomInfo.sockets]
+            .map((sock) => clients.get(sock))
+            .filter((c): c is ClientInfo => c !== undefined && stableUserId(c) === targetId);
+
+          if (msg.type === "room-ban") {
+            const target = targets[0];
+            const name = target?.name ?? targetId;
+            if (!roomInfo.bans.some((b) => b.id === targetId)) {
+              // Every handle the room has on them right now. Whatever is
+              // unknown (they already left, so there is no live connection to
+              // read an address off) is simply absent — the ban still holds on
+              // the id, which is the one that is always there.
+              roomInfo.bans = [
+                ...roomInfo.bans,
+                {
+                  id: targetId,
+                  name,
+                  bannedAt: Date.now(),
+                  accountId: target?.accountId ?? null,
+                  guestName: target && !target.accountId ? (target.name?.trim().toLowerCase() ?? null) : null,
+                  ip: target?.ip ?? null,
+                },
+              ];
+            }
+            // A banned admin stops being one: coming back as a manager the
+            // moment somebody unbans them is not what banning meant.
+            roomInfo.admins = roomInfo.admins.filter((a) => a.id !== targetId);
+            if (roomInfo.mutedMembers.includes(targetId)) {
+              roomInfo.mutedMembers = roomInfo.mutedMembers.filter((id) => id !== targetId);
+            }
+            persistRoomRecord(info.room, roomInfo);
+            publishRoomRecord(info.room, roomInfo);
+            broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+            sendRoomBansToManagers(info.room, roomInfo);
+          } else {
+            // Kick cooldown: 10 seconds
+            if (!roomInfo.kickedMembers) {
+              roomInfo.kickedMembers = new Map();
+            }
+            const kickUntil = Date.now() + ROOM_KICK_COOLDOWN_MS;
+            roomInfo.kickedMembers.set(targetId, kickUntil);
+            clusterEvent("room:kick", { room: info.room, userId: targetId, until: kickUntil });
+          }
+
+          for (const target of targets) {
+            // Told before being removed, so their client can say what happened
+            // instead of looking like the connection dropped.
+            send(target.socket, {
+              type: "room-removed",
+              room: info.room,
+              banned: msg.type === "room-ban",
+              cooldownSeconds: msg.type === "room-kick" ? 10 : undefined,
+            });
+            send(target.socket, {
+              type: msg.type === "room-ban" ? "room-banned" : "room-kicked",
+              message:
+                msg.type === "room-ban"
+                  ? "Você foi banido desta sala pela administração."
+                  : "Você foi expulso da sala pela administração.",
+              cooldownSeconds: msg.type === "room-kick" ? 10 : undefined,
+            });
+            leaveRoom(target);
+          }
+          break;
+        }
+        // Lifting a ban. Both owner and admins can unban (room managers).
+        case "room-unban": {
+          if (!info.room) return;
+          if (!(await consumeRateLimit(wsVideoSourceLimiter, info.rateLimitKey, "video-source"))) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo) return;
+          if (!isRoomManager(roomInfo, info)) return;
+          const targetId = typeof msg.userId === "string" ? msg.userId.trim() : "";
+          if (!roomInfo.bans.some((b) => b.id === targetId)) return;
+          roomInfo.bans = roomInfo.bans.filter((b) => b.id !== targetId);
+          if (roomInfo.kickedMembers) {
+            roomInfo.kickedMembers.delete(targetId);
+          }
+          persistRoomRecord(info.room, roomInfo);
+          publishRoomRecord(info.room, roomInfo);
+          broadcastToRoom(info.room, { type: "room-settings", ...roomSettingsPayload(roomInfo) });
+          sendRoomBansToManagers(info.room, roomInfo);
+          break;
+        }
+        // Who is banned is only ever sent to the people who can act on it —
+        // a list of names of people a room threw out is not something the
+        // room at large needs, and roomSettingsPayload goes to everybody.
+        case "room-bans": {
+          if (!info.room) return;
+          const roomInfo = rooms.get(info.room);
+          if (!roomInfo || !isRoomManager(roomInfo, info)) return;
+          send(socket, { type: "room-bans", bans: roomInfo.bans.map(publicRoomBan) });
           break;
         }
         // Adding, removing and steering a room video source (see
