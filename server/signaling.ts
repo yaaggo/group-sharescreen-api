@@ -1848,11 +1848,24 @@ interface ClusterStateDump {
   }[];
   pendingSignals: [string, PendingSignal[]][];
   turnstile: [string, number][];
-  announcement: Announcement | null;
+  // Deliberately absent: the active announcement, the partner config and the
+  // supporters list. All three come from persistent storage, every worker
+  // loads them itself at startup (see registerSignalingRoutes), and every
+  // later change is published on the bus by its own event
+  // ("announcement:set", "partner:config", "supporters:set").
+  //
+  // Carrying them here was not merely redundant, it was destructive. A worker
+  // answers "state:request" with whatever it holds *at that instant*, and on a
+  // full restart that instant is often before its own async load has resolved
+  // — so it answers with an empty list, and the worker that asked overwrites
+  // its own correctly-loaded list with nothing. That is the whole of "os
+  // apoiadores resetam a cada restart".
+  //
+  // The counters below stay: announcementStats and partnerStats live only in
+  // memory, so a sibling really is the only place a starting worker can learn
+  // them from.
   announcementStats: { viewerIds: string[]; buttonClicks: number; xClicks: number } | null;
-  partnerConfig: PartnerConfig;
   partnerStats: [string, { viewerIds: string[]; counts: Omit<PartnerStatsEntry, "viewerIds"> }][];
-  supporters: Supporter[];
 }
 
 function buildClusterStateDump(): ClusterStateDump {
@@ -1874,7 +1887,6 @@ function buildClusterStateDump(): ClusterStateDump {
     })),
     pendingSignals: [...pendingSignals.entries()],
     turnstile: [...turnstileVerifiedIps.entries()],
-    announcement: currentAnnouncement,
     announcementStats: announcementStats
       ? {
           viewerIds: [...announcementStats.viewerIds],
@@ -1882,7 +1894,6 @@ function buildClusterStateDump(): ClusterStateDump {
           xClicks: announcementStats.xClicks,
         }
       : null,
-    partnerConfig,
     partnerStats: [...partnerStats.entries()].map(([id, entry]) => [
       id,
       {
@@ -1897,7 +1908,6 @@ function buildClusterStateDump(): ClusterStateDump {
         },
       },
     ]),
-    supporters: currentSupporters,
   };
 }
 
@@ -1905,6 +1915,12 @@ function buildClusterStateDump(): ClusterStateDump {
 // only added, never removed. A live event that landed while the dump was in
 // flight describes a *newer* truth than the dump does, and must not be
 // undone by it.
+//
+// The rule holds for everything in here now, including the counters at the
+// bottom. It used to be broken by three wholesale assignments (the
+// announcement, the partner config, the supporters list), which is how a
+// restart could wipe a list that had just been read off Redis — see
+// ClusterStateDump, where those three no longer travel at all.
 function applyClusterStateDump(dump: ClusterStateDump): void {
   for (const snap of dump.clients) applyClientSnapshot(snap);
   for (const entry of dump.rooms) {
@@ -1936,21 +1952,21 @@ function applyClusterStateDump(dump: ClusterStateDump): void {
   for (const [ip, at] of dump.turnstile) {
     if (!turnstileVerifiedIps.has(ip)) turnstileVerifiedIps.set(ip, at);
   }
-  currentAnnouncement = dump.announcement;
-  announcementStats = dump.announcementStats
-    ? {
-        viewerIds: new Set(dump.announcementStats.viewerIds),
-        buttonClicks: dump.announcementStats.buttonClicks,
-        xClicks: dump.announcementStats.xClicks,
-      }
-    : null;
-  partnerConfig = dump.partnerConfig;
+  // Only taken when this worker has none of its own: these are running
+  // totals, and a straggler's dump answering the same request must not reset
+  // a counter that has been ticking since.
+  if (!announcementStats && dump.announcementStats) {
+    announcementStats = {
+      viewerIds: new Set(dump.announcementStats.viewerIds),
+      buttonClicks: dump.announcementStats.buttonClicks,
+      xClicks: dump.announcementStats.xClicks,
+    };
+  }
   for (const [id, entry] of dump.partnerStats) {
     const target = getPartnerStats(id);
     for (const viewerId of entry.viewerIds) target.viewerIds.add(viewerId);
     Object.assign(target, entry.counts);
   }
-  currentSupporters = dump.supporters;
 }
 
 // How long a starting worker waits for an answer before giving up and
